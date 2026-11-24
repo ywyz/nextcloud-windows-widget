@@ -1,5 +1,6 @@
 using System.Windows.Automation;
 using System.Windows.Media;
+using System.Net.Http;
 using NextcloudWidget.Core;
 
 namespace NextcloudWidget.App;
@@ -12,6 +13,8 @@ internal class WidgetDialog : Window
     protected WidgetDialog(Window owner, string title, double width, double height)
     {
         Owner = owner;
+        SetResourceReference(BackgroundProperty, "CanvasBrush");
+        SetResourceReference(ForegroundProperty, "TextBrush");
         WindowStartupLocation = WindowStartupLocation.CenterOwner;
         Title = title;
         Width = width;
@@ -97,13 +100,13 @@ internal sealed class TaskDialog : WidgetDialog
     {
         if (TaskTitle.Length == 0 || (original is null && lists.SelectedItem == null))
         {
-            MessageBox.Show(this, "请选择任务清单并填写标题。", Title);
+            WidgetPrompt.Show(this, "请选择任务清单并填写标题。", Title);
             return;
         }
         if ((!string.IsNullOrWhiteSpace(day.Text) && day.SelectedDate == null) ||
             (day.SelectedDate == null && !string.IsNullOrWhiteSpace(time.Text)))
         {
-            MessageBox.Show(this, "请填写有效的截止日期，或同时清空日期和时间。", Title);
+            WidgetPrompt.Show(this, "请填写有效的截止日期，或同时清空日期和时间。", Title);
             return;
         }
         if (day.SelectedDate is DateTime date)
@@ -113,13 +116,13 @@ internal sealed class TaskDialog : WidgetDialog
                 !TimeOnly.TryParseExact(time.Text.Trim(), new[] { "H:mm", "HH:mm" },
                     System.Globalization.CultureInfo.InvariantCulture, System.Globalization.DateTimeStyles.None, out hours))
             {
-                MessageBox.Show(this, "请使用 24 小时制填写时间，例如 14:30。", Title);
+                WidgetPrompt.Show(this, "请使用 24 小时制填写时间，例如 14:30。", Title);
                 return;
             }
             var local = date.Date.Add(hours.ToTimeSpan());
             if (TimeZoneInfo.Local.IsInvalidTime(local))
             {
-                MessageBox.Show(this, "该本地时间位于夏令时切换区间，请另选时间。", Title);
+                WidgetPrompt.Show(this, "该本地时间位于夏令时切换区间，请另选时间。", Title);
                 return;
             }
             var previous = original?.Due?.ToLocalTime();
@@ -156,15 +159,85 @@ internal sealed class ConflictDialog : WidgetDialog
 
 internal sealed class MailDialog : WidgetDialog
 {
-    public MailDialog(Window owner, MailItem message, string body) : base(owner, "阅读邮件", 530, 560)
+    private readonly string original;
+    private readonly TranslationPreferences preferences;
+    private readonly TextBox translation = BodyBox("");
+    private readonly TextBlock status = Text("");
+    private readonly TabControl tabs = new();
+    private readonly TabItem translated = new() { Header = "译文", IsEnabled = false };
+    private readonly Button translate, cancel;
+    private CancellationTokenSource? request;
+    private bool closed;
+
+    public MailDialog(Window owner, MailItem message, string body) : base(owner, "阅读邮件", 565, 580)
     {
+        original = body;
+        var host = (owner as MainWindow) ?? (MainWindow)Application.Current.MainWindow;
+        preferences = new TranslationPreferences(host.DataDirectory);
         Fields.Children.Add(Text(string.IsNullOrEmpty(message.Subject) ? "（无主题）" : message.Subject, 20));
         Fields.Children.Add(Text($"{message.Sender}   ·   {message.Date.ToLocalTime():g}"));
-        var content = new TextBox { Text = body, IsReadOnly = true, TextWrapping = TextWrapping.Wrap,
-            BorderThickness = new Thickness(0), AcceptsReturn = true, Padding = new Thickness(0, 8, 0, 0),
-            Background = Brushes.Transparent };
-        AutomationProperties.SetName(content, "邮件正文");
-        Fields.Children.Add(content);
+        var source = BodyBox(body);
+        AutomationProperties.SetName(source, "邮件正文");
+        AutomationProperties.SetAutomationId(source, "MailOriginalBody");
+        AutomationProperties.SetName(translation, "邮件译文");
+        AutomationProperties.SetAutomationId(translation, "MailTranslatedBody");
+        tabs.Items.Add(new TabItem { Header = "原文", Content = source });
+        translated.Content = translation;
+        tabs.Items.Add(translated);
+        tabs.SelectedIndex = 0;
+        Fields.Children.Add(tabs);
+        AutomationProperties.SetAutomationId(status, "TranslationStatus");
+        Fields.Children.Add(status);
+        translate = ActionButton("翻译", Translate);
+        AutomationProperties.SetAutomationId(translate, "TranslateMail");
+        translate.IsEnabled = !string.IsNullOrWhiteSpace(body) && body is not ("（正文为空）" or "（此邮件无正文）" or "此邮件已加密，服务器无法提供正文。");
+        cancel = ActionButton("取消翻译", (_, _) => request?.Cancel());
+        AutomationProperties.SetAutomationId(cancel, "CancelTranslation");
+        cancel.Visibility = Visibility.Collapsed;
         ActionButton("关闭", (_, _) => Close()).IsCancel = true;
+        Closed += (_, _) => { closed = true; request?.Cancel(); };
+    }
+
+    private static TextBox BodyBox(string value) => new()
+    {
+        Text = value, IsReadOnly = true, TextWrapping = TextWrapping.Wrap,
+        AcceptsReturn = true, Padding = new Thickness(7), MinHeight = 150
+    };
+
+    private async void Translate(object sender, RoutedEventArgs args)
+    {
+        if (request != null) return;
+        using var cancellation = new CancellationTokenSource();
+        request = cancellation;
+        translate.IsEnabled = false;
+        try
+        {
+            var options = preferences.Load();
+            if (options == null)
+            {
+                var settings = new TranslationSettingsDialog(this, preferences);
+                status.Text = settings.ShowDialog() == true ? "模型已配置。点击“翻译”发送本封邮件正文。" : "请先配置翻译模型。";
+                return;
+            }
+            status.Text = $"正在使用 {options.Model} 翻译为{options.TargetLanguage}…";
+            cancel.Visibility = Visibility.Visible;
+            string? key = preferences.Keys.Read(options);
+            var result = await new NextcloudWidget.Core.Translation.MailTranslator().TranslateAsync(options, key, original, cancellation.Token);
+            cancellation.Token.ThrowIfCancellationRequested();
+            translation.Text = result;
+            translated.IsEnabled = true;
+            tabs.SelectedItem = translated;
+            status.Text = $"已翻译为{options.TargetLanguage}。";
+        }
+        catch (OperationCanceledException) { if (!closed) status.Text = cancellation.IsCancellationRequested ? "翻译已取消。" : "模型请求超时，请重试。"; }
+        catch (InvalidDataException ex) { if (!closed) status.Text = ex.Message; }
+        catch (System.Text.Json.JsonException) { if (!closed) status.Text = "模型或设置返回了无效的 JSON。"; }
+        catch (HttpRequestException) { if (!closed) status.Text = "无法连接翻译模型，请检查地址和网络。"; }
+        catch (Exception) { if (!closed) status.Text = "翻译失败，请检查翻译设置及 Windows 凭据。"; }
+        finally
+        {
+            request = null;
+            if (!closed) { translate.IsEnabled = true; cancel.Visibility = Visibility.Collapsed; }
+        }
     }
 }

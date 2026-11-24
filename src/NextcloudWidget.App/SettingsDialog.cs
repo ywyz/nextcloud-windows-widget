@@ -18,7 +18,7 @@ internal sealed class SettingsDialog : WidgetDialog
     private Version? displayedUpdate;
     private bool working;
 
-    public SettingsDialog(MainWindow host, WidgetService service) : base(host, "设置", 410, 390)
+    public SettingsDialog(MainWindow host, WidgetService service) : base(host, "设置", 410, Math.Min(565, SystemParameters.WorkArea.Height))
     {
         this.host = host;
         this.service = service;
@@ -30,6 +30,11 @@ internal sealed class SettingsDialog : WidgetDialog
         reauthorize.Content = "重新授权并保留缓存";
         feedback.Margin = new Thickness(0, 9, 0, 12);
         Fields.Children.Add(feedback);
+        Fields.Children.Add(Text("邮件翻译", 19));
+        var translation = new Button { Content = "配置翻译模型…" };
+        System.Windows.Automation.AutomationProperties.SetAutomationId(translation, "TranslationSettingsButton");
+        Configure(translation, (_, _) => new TranslationSettingsDialog(this,
+            new TranslationPreferences(host.DataDirectory)).ShowDialog());
         Fields.Children.Add(Text("软件更新", 19));
         var version = typeof(SettingsDialog).Assembly.GetName().Version;
         Fields.Children.Add(Text($"当前版本 {version?.ToString(3)}"));
@@ -70,9 +75,10 @@ internal sealed class SettingsDialog : WidgetDialog
             if (service.IsConnected)
             {
                 var pending = (await service.GetTasksAsync(lifetime.Token)).Count(t => t.SyncState is "pending" or "conflict");
-                string prompt = pending == 0 ? "断开后会清除本机缓存的任务、邮件和登录信息。继续吗？" :
-                    $"有 {pending} 条本地更改尚未同步或存在冲突。断开会丢弃这些更改，并清除任务、邮件和登录信息。继续吗？";
-                if (MessageBox.Show(this, prompt, "断开账户", MessageBoxButton.YesNo, MessageBoxImage.Warning,
+                var mailPending = await service.GetPendingMailOperationCountAsync(lifetime.Token);
+                string prompt = pending == 0 && mailPending == 0 ? "断开后会清除本机缓存的任务、邮件和登录信息。继续吗？" :
+                    $"有 {pending} 条待办更改尚未同步或存在冲突，另有 {mailPending} 条邮件操作尚未同步。断开会丢弃这些操作，并清除本机缓存和登录信息。继续吗？";
+                if (WidgetPrompt.Show(this, prompt, "断开账户", MessageBoxButton.YesNo, MessageBoxImage.Warning,
                     MessageBoxResult.No) != MessageBoxResult.Yes) return;
                 await host.DisconnectAsync(lifetime.Token);
                 address.Clear();

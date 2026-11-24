@@ -166,6 +166,12 @@ public sealed class WidgetService : IDisposable
         Local<IReadOnlyList<MailItem>>(c => c.Mail(), ct);
     public Task<IReadOnlyList<MailItem>> GetMailHeadersAsync(CancellationToken ct = default) =>
         Local<IReadOnlyList<MailItem>>(c => c.MailHeaders(), ct);
+    public Task<int> GetPendingMailOperationCountAsync(CancellationToken ct = default) =>
+        Local(c => c.PendingMailOperationCount(), ct);
+    public Task MarkMailReadAsync(IReadOnlyCollection<string> ids, CancellationToken ct = default) =>
+        Local(c => { c.QueueMailActions(ids, "read"); return true; }, ct);
+    public Task MoveMailToTrashAsync(IReadOnlyCollection<string> ids, CancellationToken ct = default) =>
+        Local(c => { c.QueueMailActions(ids, "trash"); return true; }, ct);
     public Task<SyncInfo> GetSyncInfoAsync(CancellationToken ct = default) => Local(c => c.SyncInfo(), ct);
     public Task<TaskItem?> GetConflictServerVersionAsync(string id, CancellationToken ct = default) =>
         Local(c => c.ConflictRemote(id), ct);
@@ -240,7 +246,22 @@ public sealed class WidgetService : IDisposable
         await s.MailSync.WaitAsync(token).ConfigureAwait(false);
         try
         {
+            var rejected = new List<(string Id, string Kind, HttpRequestException Error)>();
+            var actionFailure = await PushMailActions(s, rejected, token).ConfigureAwait(false);
             var messages = await MailClient.FetchAsync(s.Http, s.Account.Server, [], token).ConfigureAwait(false);
+            var inbox = messages.Select(message => message.Id).ToHashSet();
+            foreach (var (id, kind, error) in rejected)
+            {
+                // A move can succeed just before its reply is lost. A missing row in the
+                // 50-message window alone cannot distinguish that from an older inbox item.
+                if (!inbox.Contains(id) && await MailClient.IsMessageGoneAsync(s.Http, s.Account.Server, id, token).ConfigureAwait(false))
+                {
+                    s.Cache.AcceptMailAction(id, kind);
+                    continue;
+                }
+                s.Cache.RemoveMailAction(id, kind);
+                actionFailure ??= new IOException($"服务器拒绝了邮件操作（HTTP {(int)error.StatusCode!}），已恢复本地显示。", error);
+            }
             s.Cache.SaveMail(messages);
             s.Cache.MarkSync("mail");
             Exception? bodyFailure = null;
@@ -263,11 +284,48 @@ public sealed class WidgetService : IDisposable
                     break;
                 }
             }
+            if (actionFailure != null) throw actionFailure;
             if (bodyFailure != null) throw new IOException("邮件列表已更新，部分正文将于下次同步时重试。", bodyFailure);
             return true;
         }
         finally { s.MailSync.Release(); }
     }, ct);
+
+    private static async Task<Exception?> PushMailActions(Session session,
+        List<(string Id, string Kind, HttpRequestException Error)> rejected, CancellationToken ct)
+    {
+        Exception? failure = null;
+        var actions = new MailActionClient(session.Http, session.Account.Server);
+        foreach (var (id, kind) in session.Cache.PendingMailActions())
+        {
+            try
+            {
+                if (kind == "read")
+                    await actions.MarkReadAsync(id, ct).ConfigureAwait(false);
+                else if (kind == "trash")
+                    await actions.MoveToTrashAsync(id, ct).ConfigureAwait(false);
+                else
+                {
+                    session.Cache.RemoveMailAction(id, kind);
+                    failure ??= new InvalidDataException("检测到无法识别的本地邮件操作，已取消该操作。");
+                    continue;
+                }
+                session.Cache.AcceptMailAction(id, kind);
+            }
+            catch (MailTrashUnavailableException ex)
+            {
+                session.Cache.RemoveMailAction(id, kind);
+                failure = ex;
+            }
+            catch (HttpRequestException ex) when (ex.StatusCode is HttpStatusCode.Forbidden or HttpStatusCode.NotFound
+                or HttpStatusCode.BadRequest or HttpStatusCode.Conflict or HttpStatusCode.Gone or HttpStatusCode.MethodNotAllowed
+                or HttpStatusCode.UnprocessableEntity or HttpStatusCode.NotImplemented)
+            {
+                rejected.Add((id, kind, ex));
+            }
+        }
+        return failure;
+    }
 
     public Task<string> GetMailBodyAsync(string id, CancellationToken ct = default) =>
         Use((s, token) => Body(s, id, token), ct);

@@ -12,29 +12,33 @@ static void Check(bool result, string message)
 }
 
 await MailProtocolChecks.RunAsync();
+await MailTrashProtocolChecks.RunAsync();
+await MailRejectedChecks.RunAsync();
+MailCacheUpgradeChecks.Run();
 if (args.SequenceEqual(new[] { "--protocol-only" })) return;
 
 var server = new Uri(Required("NCW_LIVE_URL"));
 Check(server.IsLoopback && server.Scheme == "https", "The live fixture must be a loopback HTTPS server.");
 var pin = Required("NCW_LIVE_PIN");
 var token = Required("NCW_LIVE_TOKEN");
-HttpClient MakeClient() => new(new HttpClientHandler
+HttpClientHandler MakeTransport() => new()
 {
     AllowAutoRedirect = false, UseProxy = false,
     ServerCertificateCustomValidationCallback = (request, cert, _, _) =>
         request.RequestUri?.Authority == server.Authority && cert != null &&
         pin.Equals(cert.GetCertHashString(HashAlgorithmName.SHA256), StringComparison.OrdinalIgnoreCase)
-});
+};
+HttpClient MakeClient() => new(MakeTransport());
 
 var data = Directory.CreateTempSubdirectory("ncw-live-");
-WidgetService Open(string name, bool offline = false, bool seed = true)
+WidgetService Open(string name, bool offline = false, bool seed = true, Func<HttpClient>? client = null)
 {
     var directory = Directory.CreateDirectory(Path.Combine(data.FullName, name));
     var profile = Path.Combine(directory.FullName, "account.json");
     if (seed && !File.Exists(profile))
         File.WriteAllText(profile, JsonSerializer.Serialize(new Account(Guid.NewGuid(), server, "fixture")));
     return new WidgetService(directory.FullName, new FixtureSecrets(token),
-        offline ? () => new HttpClient(new OfflineHandler()) : MakeClient);
+        offline ? () => new HttpClient(new OfflineHandler()) : client ?? MakeClient);
 }
 
 async Task GrantTestDeviceAsync(Uri login)
@@ -114,6 +118,40 @@ try
     Check((await offline.GetMailBodyAsync(mail[0].Id)) == mail[0].Body, "Body was not available offline.");
     Check((await offline.GetTasksAsync()).Any(t => t.Id == taskId), "Task cache unavailable offline.");
     Console.WriteLine("PASS Real Nextcloud Mail OCS, two IMAP inboxes, newest 50 per account, offline SQLite body and tasks.");
+
+    string Id(string user, int number) => mail.Single(m => m.Subject == $"fixture-{user}-{number:00}").Id;
+    string first = Id("one", 51), second = Id("one", 50), third = Id("two", 51), move = Id("one", 48);
+    await offline.MarkMailReadAsync([first]);
+    await offline.MarkMailReadAsync([first, second, third, second]);
+    await offline.MoveMailToTrashAsync([move, move]);
+    Check(await offline.GetPendingMailOperationCountAsync() == 4, "Offline actions were not deduplicated.");
+    Check(!(await offline.GetMailHeadersAsync()).Any(m => m.Id == move || m.Id == first && m.Unread),
+        "Optimistic flags and trash visibility are wrong.");
+    try { await offline.SyncMailAsync(); throw new Exception("Offline sync unexpectedly succeeded."); }
+    catch (HttpRequestException) { }
+    using var restarted = Open("primary", client: () => new HttpClient(new LoseMoveReply(MakeTransport())));
+    Check(await restarted.GetPendingMailOperationCountAsync() == 4, "Restart lost the offline actions.");
+    try { await restarted.SyncMailAsync(); throw new Exception("The lost move acknowledgement was ignored."); }
+    catch (HttpRequestException ex) when (ex.Message == LoseMoveReply.Failure) { }
+    Check(await restarted.GetPendingMailOperationCountAsync() == 1, "The unacknowledged move should still be queued.");
+    Check(!(await restarted.GetMailAsync()).Any(m => m.Id == move), "A lost reply resurfaced the trashed message.");
+    await primary.SyncMailAsync();
+    Check(await primary.GetPendingMailOperationCountAsync() == 0, "Retry did not reconcile the move after its reply was lost.");
+    var after = await primary.GetMailHeadersAsync();
+    Check(!after.Any(m => m.Id == move) && after.Count == 100, "Trash retry did not restore the newest-50 cache window.");
+    Check(after.Where(m => m.Id == first || m.Id == second || m.Id == third).All(m => !m.Unread),
+        "Synced read flags reverted.");
+    string noTrash = Id("two", 47);
+    await primary.MoveMailToTrashAsync([noTrash]);
+    try { await primary.SyncMailAsync(); throw new Exception("Unsafe move unexpectedly succeeded."); }
+    catch (NextcloudWidget.Core.Mail.MailTrashUnavailableException) { }
+    Check((await primary.GetMailAsync()).Any(m => m.Id == noTrash && m.Body.Length > 0)
+        && await primary.GetPendingMailOperationCountAsync() == 0, "Missing trash failed to restore the original message and body.");
+    await other.SyncMailAsync();
+    var secondDevice = await other.GetMailHeadersAsync();
+    Check(!secondDevice.Any(m => m.Id == move) && secondDevice.Count(m => !m.Unread) == 3,
+        "The independent device did not see the exact server-side mutations.");
+    Console.WriteLine("PASS Offline read/batch/trash, durable restart, lost move acknowledgement, safe missing-trash rollback and independent server readback.");
 }
 finally
 {
@@ -135,4 +173,20 @@ sealed class OfflineHandler : HttpMessageHandler
 {
     protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct) =>
         throw new HttpRequestException("Fixture is offline.");
+}
+
+sealed class LoseMoveReply(HttpMessageHandler inner) : DelegatingHandler(inner)
+{
+    internal const string Failure = "Fixture dropped the successful move response.";
+    protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)
+    {
+        var response = await base.SendAsync(request, ct);
+        if (request.Method == HttpMethod.Post && request.RequestUri!.AbsolutePath.EndsWith("/move", StringComparison.Ordinal))
+        {
+            response.EnsureSuccessStatusCode();
+            response.Dispose();
+            throw new HttpRequestException(Failure);
+        }
+        return response;
+    }
 }

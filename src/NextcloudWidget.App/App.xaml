@@ -6,6 +6,13 @@
     <Style TargetType="Window">
       <Setter Property="FontFamily" Value="Segoe UI, Microsoft YaHei UI"/>
       <Setter Property="FontSize" Value="14"/>
+      <Setter Property="Foreground" Value="{DynamicResource TextBrush}"/>
+      <Setter Property="Background" Value="{DynamicResource CanvasBrush}"/>
+    </Style>
+    <Style x:Key="AccentButton" TargetType="Button">
+      <Setter Property="Background" Value="{DynamicResource AccentBrush}"/>
+      <Setter Property="Foreground" Value="{DynamicResource AccentTextBrush}"/>
+      <Setter Property="Padding" Value="12,4"/>
     </Style>
   </Application.Resources>
 </Application>

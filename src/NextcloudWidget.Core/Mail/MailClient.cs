@@ -41,10 +41,7 @@ internal static class MailClient
 
     internal static async Task<string> FetchBodyAsync(HttpClient client, Uri server, string id, CancellationToken ct)
     {
-        if (!long.TryParse(id, NumberStyles.None, CultureInfo.InvariantCulture, out var number) || number < 1)
-            throw new ArgumentException("邮件编号无效。", nameof(id));
-
-        var message = await GetDataAsync(client, server, $"message/{number.ToString(CultureInfo.InvariantCulture)}", ct);
+        var message = await GetDataAsync(client, server, $"message/{PositiveMessageNumber(id)}", ct);
         if (!message.TryGetProperty("body", out var body) || body.ValueKind == JsonValueKind.Null)
         {
             if (message.TryGetProperty("smime", out var smime) &&
@@ -61,7 +58,18 @@ internal static class MailClient
         return text.Length == 0 ? "（此邮件无正文）" : text;
     }
 
-    private static bool IsInbox(JsonElement folder)
+    internal static async Task<bool> IsMessageGoneAsync(HttpClient client, Uri server, string id, CancellationToken ct)
+    {
+        var result = await GetDataAsync(client, server, $"message/{PositiveMessageNumber(id)}", ct, checkMissing: true);
+        return result.ValueKind == JsonValueKind.Undefined;
+    }
+
+    private static string PositiveMessageNumber(string id) =>
+        long.TryParse(id, NumberStyles.None, CultureInfo.InvariantCulture, out var number) && number > 0
+            ? number.ToString(CultureInfo.InvariantCulture)
+            : throw new ArgumentException("邮件编号无效。", nameof(id));
+
+    internal static bool IsInbox(JsonElement folder)
     {
         if (string.Equals(Text(folder, "name"), "inbox", StringComparison.OrdinalIgnoreCase))
             return true;
@@ -93,7 +101,8 @@ internal static class MailClient
         value.TryGetProperty(field, out var property) && property.ValueKind == JsonValueKind.String
             ? property.GetString() ?? "" : "";
 
-    private static async Task<JsonElement> GetDataAsync(HttpClient client, Uri server, string relativePath, CancellationToken ct)
+    internal static async Task<JsonElement> GetDataAsync(HttpClient client, Uri server, string relativePath,
+        CancellationToken ct, bool checkMissing = false)
     {
         var url = server.GetLeftPart(UriPartial.Path).TrimEnd('/') + "/ocs/v2.php/apps/mail/" + relativePath;
         using var request = new HttpRequestMessage(HttpMethod.Get, url);
@@ -103,11 +112,18 @@ internal static class MailClient
         if (response.StatusCode == HttpStatusCode.NotFound && relativePath == "account/list")
             throw new HttpRequestException("Nextcloud Mail 接口不可用。请确认服务器已启用 Mail 5.2 或更新版本。",
                 null, response.StatusCode);
-        response.EnsureSuccessStatusCode();
+        bool missing = checkMissing && response.StatusCode == HttpStatusCode.NotFound;
+        if (!missing) response.EnsureSuccessStatusCode();
         using var stream = await response.Content.ReadAsStreamAsync(ct);
         using var json = await JsonDocument.ParseAsync(stream, cancellationToken: ct);
         var envelope = json.RootElement.GetProperty("ocs");
         var meta = envelope.GetProperty("meta");
+        if (missing)
+        {
+            if (meta.TryGetProperty("statuscode", out var code) && code.TryGetInt32(out var number) && number == 404)
+                return default;
+            throw new InvalidDataException("未能确认服务器上的邮件是否已移走。");
+        }
         if (Text(meta, "status") != "ok")
             throw new InvalidDataException("Nextcloud Mail 返回同步错误。");
         return envelope.GetProperty("data").Clone();

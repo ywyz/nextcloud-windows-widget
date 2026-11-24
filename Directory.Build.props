@@ -1,6 +1,6 @@
 <Project>
   <PropertyGroup>
-    <Version Condition="'$(Version)' == ''">0.1.0</Version>
+    <Version Condition="'$(Version)' == ''">0.2.0</Version>
     <Product>Nextcloud Windows Widget</Product>
     <Company>ywyz</Company>
     <Nullable>enable</Nullable>

@@ -20,6 +20,7 @@ internal sealed class WidgetCache
             CREATE TABLE IF NOT EXISTS tasks(id TEXT PRIMARY KEY, list TEXT NOT NULL, etag TEXT, remote TEXT, local TEXT, state TEXT NOT NULL, revision INTEGER NOT NULL DEFAULT 0);
             CREATE INDEX IF NOT EXISTS tasks_list ON tasks(list);
             CREATE TABLE IF NOT EXISTS mail(id TEXT PRIMARY KEY, subject TEXT NOT NULL, sender TEXT NOT NULL, date TEXT NOT NULL, body TEXT NOT NULL, unread INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS mail_actions(id TEXT NOT NULL, kind TEXT NOT NULL, accepted INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(id,kind));
             CREATE TABLE IF NOT EXISTS sync(channel TEXT PRIMARY KEY, stamp TEXT NOT NULL);
             """));
     }
@@ -75,7 +76,9 @@ internal sealed class WidgetCache
         Rows(db, "SELECT id,name,writable FROM lists WHERE id=$p0", MapList, id).Single();
     private static MailItem MapMail(SqliteDataReader r) => new(r.GetString(0), r.GetString(1), r.GetString(2),
         DateTimeOffset.Parse(r.GetString(3), CultureInfo.InvariantCulture), r.GetString(4), r.GetBoolean(5));
-    private const string MailColumns = "SELECT id,subject,sender,date,body,unread FROM mail";
+    private const string VisibleMail = " FROM mail WHERE NOT EXISTS (SELECT 1 FROM mail_actions a WHERE a.id=mail.id AND a.kind='trash')";
+    private const string EffectiveUnread = "(unread AND NOT EXISTS (SELECT 1 FROM mail_actions a WHERE a.id=mail.id AND a.kind='read'))";
+    private const string MailColumns = "SELECT id,subject,sender,date,body," + EffectiveUnread + VisibleMail;
 
     internal List<TaskList> Lists() => Read(db => Rows(db, "SELECT id,name,writable FROM lists WHERE present=1 ORDER BY name", MapList));
     internal List<TaskItem> Tasks() => Read(db =>
@@ -178,10 +181,26 @@ internal sealed class WidgetCache
 
     internal List<MailItem> Mail() => Read(db => Rows(db, MailColumns + " ORDER BY date DESC", MapMail));
     internal List<MailItem> MailHeaders() => Read(db => Rows(db,
-        "SELECT id,subject,sender,date,'',unread FROM mail ORDER BY date DESC", MapMail));
+        "SELECT id,subject,sender,date,''," + EffectiveUnread + VisibleMail + " ORDER BY date DESC", MapMail));
     internal List<string> MissingBodies() => Read(db => Rows(db,
-        "SELECT id FROM mail WHERE body='' ORDER BY date DESC", r => r.GetString(0)));
-    internal MailItem? Message(string id) => Read(db => Rows(db, MailColumns + " WHERE id=$p0", MapMail, id).SingleOrDefault());
+        "SELECT id" + VisibleMail + " AND body='' ORDER BY date DESC", r => r.GetString(0)));
+    internal MailItem? Message(string id) => Read(db => Rows(db, MailColumns + " AND id=$p0", MapMail, id).SingleOrDefault());
+
+    internal void QueueMailActions(IReadOnlyCollection<string> ids, string kind) => Change(db =>
+    {
+        foreach (var id in ids.Distinct(StringComparer.Ordinal))
+            Run(db, "INSERT OR IGNORE INTO mail_actions(id,kind) SELECT id,$p1" + VisibleMail +
+                " AND id=$p0 AND ($p1='trash' OR unread=1)", id, kind);
+    });
+
+    internal List<(string Id, string Kind)> PendingMailActions() => Read(db => Rows(db,
+        "SELECT id,kind FROM mail_actions WHERE accepted=0 ORDER BY kind,id", r => (r.GetString(0),r.GetString(1))));
+    internal int PendingMailOperationCount() => Read(db => Rows(db,
+        "SELECT count(*) FROM mail_actions WHERE accepted=0", r => r.GetInt32(0)).Single());
+    internal void AcceptMailAction(string id, string kind) => Change(db => Run(db,
+        "UPDATE mail_actions SET accepted=$p2 WHERE id=$p0 AND kind=$p1", id, kind, DateTimeOffset.UtcNow.ToUnixTimeSeconds()));
+    internal void RemoveMailAction(string id, string kind) => Change(db => Run(db,
+        "DELETE FROM mail_actions WHERE id=$p0 AND kind=$p1", id, kind));
     internal void SaveMail(IReadOnlyList<MailItem> messages) => Change(db =>
     {
         Run(db, "CREATE TEMP TABLE current_mail(id TEXT PRIMARY KEY)");
@@ -191,7 +210,17 @@ internal sealed class WidgetCache
             Run(db, "INSERT INTO mail VALUES($p0,$p1,$p2,$p3,$p4,$p5) ON CONFLICT(id) DO UPDATE SET subject=excluded.subject,sender=excluded.sender,date=excluded.date,unread=excluded.unread,body=CASE WHEN mail.body='' THEN excluded.body ELSE mail.body END",
                 m.Id, m.Subject, m.Sender, m.Date.ToUniversalTime().ToString("O"), m.Body, m.Unread);
         }
-        Run(db, "DELETE FROM mail WHERE id NOT IN (SELECT id FROM current_mail)");
+        // An accepted read can precede Mail's flag-cache refresh. After two minutes a
+        // successful pull wins even if another device marked it unread in the meantime.
+        // Keep only the moved ID for a week after the inbox drops it, so a stale
+        // response cannot restore its old database ID or retain its cached body.
+        Run(db, """
+            DELETE FROM mail_actions WHERE accepted>0 AND (
+                (kind='read' AND (id NOT IN (SELECT id FROM current_mail) OR id IN (SELECT id FROM mail WHERE unread=0)
+                                 OR accepted <= $p0-120 OR accepted > $p0))
+                OR (kind='trash' AND id NOT IN (SELECT id FROM current_mail) AND accepted <= $p0-604800))
+            """, DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+        Run(db, "DELETE FROM mail WHERE id NOT IN (SELECT id FROM current_mail) AND id NOT IN (SELECT id FROM mail_actions WHERE accepted=0)");
     });
     internal void SaveBody(string id, string body) => Change(db => Run(db, "UPDATE mail SET body=$p0 WHERE id=$p1", body, id));
     internal void MarkSync(string channel) => Change(db => Run(db, "INSERT INTO sync VALUES($p0,$p1) ON CONFLICT(channel) DO UPDATE SET stamp=excluded.stamp", channel, DateTimeOffset.UtcNow.ToString("O")));

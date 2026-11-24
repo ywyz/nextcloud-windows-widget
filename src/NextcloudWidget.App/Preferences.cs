@@ -5,8 +5,10 @@ namespace NextcloudWidget.App;
 internal sealed class Preferences
 {
     private readonly string path;
+    internal string DirectoryPath => Path.GetDirectoryName(path)!;
     public sealed record Values(bool Pinned = false, double? Left = null, double? Top = null,
-        double? Width = null, double? Height = null, DateTimeOffset? LastUpdateCheck = null);
+        double? Width = null, double? Height = null, DateTimeOffset? LastUpdateCheck = null,
+        bool DarkMode = false, string? LastTaskList = null);
     public Values State { get; private set; }
 
     public Preferences(string directory)

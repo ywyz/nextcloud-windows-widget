@@ -21,7 +21,7 @@ docker run -d --name "$mail" --network "$fixture" --network-alias mail \
     -e "GREENMAIL_OPTS=-Dgreenmail.setup.test.all -Dgreenmail.hostname=0.0.0.0 -Dgreenmail.users=one:$password@fixture.test,two:$password@fixture.test" \
     greenmail/standalone:2.1.3 >/dev/null
 docker run -d --name "$cloud" --network "$fixture" -p 127.0.0.1::443 \
-    -e NEXTCLOUD_ADMIN_USER=fixture -e "NEXTCLOUD_ADMIN_PASSWORD=$password" \
+    -e NEXTCLOUD_ADMIN_USER=installer -e "NEXTCLOUD_ADMIN_PASSWORD=$password" \
     -e SQLITE_DATABASE=nextcloud -e "NEXTCLOUD_TRUSTED_DOMAINS=localhost 127.0.0.1" \
     nextcloud:32-apache >/dev/null
 occ() { docker exec -u www-data "$cloud" php occ "$@"; }
@@ -32,6 +32,7 @@ for ((i=0; i<150; i++)); do
     sleep 2
 done
 occ status | grep 'installed: true'
+docker exec -u www-data -e "OC_PASS=$password" "$cloud" php occ user:add fixture --password-from-env >/dev/null
 openssl req -x509 -newkey rsa:2048 -noenc -days 1 -subj '/CN=localhost' \
     -addext 'subjectAltName=DNS:localhost,IP:127.0.0.1' \
     -addext 'basicConstraints=critical,CA:FALSE' \
@@ -86,6 +87,13 @@ for user in one two; do
     occ mail:account:create-imap fixture "$user" "$email" mail 3143 none "$user" "$password" \
         mail 3025 none "$user" "$password"
 done
+imap_port=$(docker port "$mail" 3143/tcp | head -1 | cut -d: -f2)
+FIXTURE_IMAP_PASSWORD="$password" python3 - "$imap_port" <<'PY'
+import imaplib, os, sys
+with imaplib.IMAP4("127.0.0.1", int(sys.argv[1])) as imap:
+    imap.login("one", os.environ["FIXTURE_IMAP_PASSWORD"])
+    assert imap.create("Corbeille")[0] == "OK"
+PY
 occ mail:account:sync 1
 occ mail:account:sync 2
 occ dav:create-calendar fixture "Widget Tasks"
@@ -94,16 +102,33 @@ export NCW_LIVE_PIN
 NCW_LIVE_PIN=$(openssl x509 -in "$testdir/cert" -outform DER | sha256sum | cut -d' ' -f1)
 export NCW_LIVE_TOKEN
 NCW_LIVE_TOKEN=$(docker exec -u www-data -e "NC_PASS=$password" "$cloud" php occ user:auth-tokens:add fixture --password-from-env | tail -1)
+api() {
+    curl --silent --show-error --fail --cacert "$testdir/cert" -u "fixture:$NCW_LIVE_TOKEN" \
+        -H 'Accept: application/json' -H 'OCS-APIRequest: true' "$@"
+}
+trash=$(api "${NCW_LIVE_URL}ocs/v2.php/apps/mail/ocs/mailboxes?accountId=1" | python3 -c 'import json,sys; print(next(x["databaseId"] for x in json.load(sys.stdin)["ocs"]["data"] if x["name"]=="Corbeille"))')
+api -X PATCH -H 'Content-Type: application/json' -d "{\"trashMailboxId\":$trash}" \
+    "${NCW_LIVE_URL}index.php/apps/mail/api/accounts/1" >/dev/null
 export WSLENV="NCW_LIVE_URL:NCW_LIVE_PIN:NCW_LIVE_TOKEN${WSLENV:+:$WSLENV}"
 "$dotnet" run --project "$(wslpath -w "$PWD/NextcloudWidget.Integration.csproj")"
-imap_port=$(docker port "$mail" 3143/tcp | head -1 | cut -d: -f2)
+occ mail:account:sync 1
+occ mail:account:sync 2
 FIXTURE_IMAP_PASSWORD="$password" python3 - "$imap_port" <<'PY'
 import imaplib, os, sys
 for user in ("one", "two"):
     with imaplib.IMAP4("127.0.0.1", int(sys.argv[1])) as imap:
         imap.login(user, os.environ["FIXTURE_IMAP_PASSWORD"])
         assert imap.select("INBOX", readonly=True)[0] == "OK"
-        status, result = imap.uid("SEARCH", None, "UNSEEN")
-        assert status == "OK" and len(result[0].split()) == 52, f"Unexpected upstream unread count for {user}"
-print("PASS Both upstream IMAP inboxes retain all 52 unread flags after body prefetch and offline reading.")
+        def search(*terms):
+            status, result = imap.uid("SEARCH", None, *terms)
+            assert status == "OK"
+            return result[0].split()
+        assert len(search("ALL")) == (51 if user == "one" else 52), f"Unexpected inbox count for {user}"
+        assert len(search("UNSEEN")) == (49 if user == "one" else 51), f"Unexpected upstream unread count for {user}"
+        if user == "one":
+            assert not search("HEADER", "Message-ID", "<one-48@fixture.test>")
+            assert imap.select("Corbeille", readonly=True)[0] == "OK"
+            assert len(search("HEADER", "Message-ID", "<one-48@fixture.test>")) == 1
+            assert len(search("UNSEEN", "HEADER", "Message-ID", "<one-48@fixture.test>")) == 1
+print("PASS Exact IMAP unread counts after explicit reads; exactly one original message moved to the configured trash.")
 PY

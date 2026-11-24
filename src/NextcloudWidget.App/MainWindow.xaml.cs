@@ -56,19 +56,24 @@ public partial class MainWindow : Window
     private Task? tasksWork, mailWork;
     private DateTimeOffset tasksNext, mailNext, updateRetryAt;
     private TimeSpan tasksRetry, mailRetry;
-    private bool stopped, readingMail, rebuildingFilter;
+    private bool stopped, readingMail, rebuildingFilter, rebuildingQuickList, savingQuickTask, changingMail;
+    private bool mailEditedDuringSync, restoringMailSelection;
+    private int pendingMailOperations;
     private DateTime displayedDay;
     private bool wasOnline = true;
     private string? tasksMessage, mailMessage;
     private ReleaseInfo? release;
     internal Version? AvailableVersion => release?.Version;
+    internal string DataDirectory => preferences.DirectoryPath;
 
     internal MainWindow(WidgetService service, Preferences preferences, bool smoke)
     {
         this.service = service;
         this.preferences = preferences;
         this.smoke = smoke;
+        WidgetTheme.Apply(preferences.State.DarkMode);
         InitializeComponent();
+        SetThemeLabel();
         var s = preferences.State;
         Topmost = s.Pinned;
         PinButton.IsChecked = s.Pinned;
@@ -83,16 +88,45 @@ public partial class MainWindow : Window
             WindowStartupLocation = WindowStartupLocation.Manual;
         }
         TasksList.SelectionChanged += (_, _) => UpdateButtons();
-        MailList.SelectionChanged += (_, _) => UpdateButtons();
+        MailList.SelectionChanged += (_, _) => { if (!restoringMailSelection) UpdateButtons(); };
         TasksList.MouseDoubleClick += (_, e) =>
         {
             if (EditButton.IsEnabled && OnItem(TasksList, e)) EditTask_Click(this, new RoutedEventArgs());
         };
         TasksList.KeyDown += (_, e) => { if (e.Key == Key.Enter && EditButton.IsEnabled) { e.Handled = true; EditTask_Click(this, e); } };
-        MailList.KeyDown += (_, e) => { if (e.Key == Key.Enter && ReadButton.IsEnabled) { e.Handled = true; ReadMail_Click(this, e); } };
+        MailList.KeyDown += (_, e) =>
+        {
+            if (e.Key == Key.Enter && ReadButton.IsEnabled) { e.Handled = true; ReadMail_Click(this, e); }
+            if (e.Key == Key.Delete && TrashButton.IsEnabled) { e.Handled = true; Trash_Click(this, e); }
+        };
+        PreviewKeyDown += (_, e) =>
+        {
+            if (e.Key == Key.F5) { e.Handled = true; Sync(true); }
+            if (e.Key == Key.N && Keyboard.Modifiers == ModifierKeys.Control && QuickList.SelectedItem != null)
+            {
+                e.Handled = true;
+                ViewTabs.SelectedItem = TasksTab;
+                QuickTitle.Focus();
+            }
+        };
         ShowCompleted.Click += (_, _) => PresentTasks();
         ListFilter.DisplayMemberPath = nameof(ListChoice.Label);
-        ListFilter.SelectionChanged += (_, _) => { if (!rebuildingFilter) PresentTasks(); };
+        QuickList.DisplayMemberPath = nameof(TaskList.Name);
+        QuickList.SelectionChanged += (_, _) =>
+        {
+            if (rebuildingQuickList) return;
+            if (QuickList.SelectedItem is TaskList list && !smoke)
+                preferences.Set(preferences.State with { LastTaskList = list.Id });
+            UpdateButtons();
+        };
+        ListFilter.SelectionChanged += (_, _) =>
+        {
+            if (rebuildingFilter) return;
+            if (ListFilter.SelectedItem is ListChoice choice && choice.Id.Length > 0 &&
+                QuickList.Items.OfType<TaskList>().FirstOrDefault(l => l.Id == choice.Id) is TaskList writable)
+                QuickList.SelectedItem = writable;
+            PresentTasks();
+        };
         timer.Tick += (_, _) => BackgroundTick();
         cacheTimer.Tick += async (_, _) =>
         {
@@ -185,7 +219,11 @@ public partial class MainWindow : Window
         finally
         {
             if (tasks) tasksNext = DateTimeOffset.UtcNow + delay;
-            else mailNext = DateTimeOffset.UtcNow + delay;
+            else
+            {
+                mailNext = mailEditedDuringSync ? DateTimeOffset.MinValue : DateTimeOffset.UtcNow + delay;
+                mailEditedDuringSync = false;
+            }
             if (!stopped && !token.IsCancellationRequested) await ReloadSafelyAsync();
         }
     }
@@ -219,6 +257,7 @@ public partial class MainWindow : Window
                 taskLists = await service.GetTaskListsAsync(token);
                 mail = await service.GetMailHeadersAsync(token);
                 lastSync = await service.GetSyncInfoAsync(token);
+                pendingMailOperations = await service.GetPendingMailOperationCountAsync(token);
             }
             else
             {
@@ -226,8 +265,18 @@ public partial class MainWindow : Window
                 taskLists = Array.Empty<TaskList>();
                 mail = Array.Empty<MailItem>();
                 lastSync = null;
+                pendingMailOperations = 0;
             }
             if (stopped) return;
+            var writableLists = taskLists.Where(l => l.CanWrite).OrderBy(l => l.Name).ToArray();
+            if (!(QuickList.ItemsSource is TaskList[] previousLists && previousLists.SequenceEqual(writableLists)))
+            {
+                rebuildingQuickList = true;
+                var chosen = (QuickList.SelectedItem as TaskList)?.Id ?? preferences.State.LastTaskList;
+                QuickList.ItemsSource = writableLists;
+                QuickList.SelectedItem = writableLists.FirstOrDefault(l => l.Id == chosen) ?? writableLists.FirstOrDefault();
+                rebuildingQuickList = false;
+            }
             var filterChoices = taskLists.Select(l => new ListChoice(l.Id, l.Name))
                 .OrderBy(l => l.Label).Prepend(new ListChoice("", "全部清单")).ToArray();
             bool filterChanged = !(ListFilter.ItemsSource is ListChoice[] oldChoices && oldChoices.SequenceEqual(filterChoices));
@@ -243,10 +292,16 @@ public partial class MainWindow : Window
                 previousSync?.TasksLastSync != lastSync?.TasksLastSync || allTasks.Count == 0) PresentTasks();
             if (MailList.ItemsSource == null || !allMail.SequenceEqual(mail))
             {
-                var selected = (MailList.SelectedItem as MailRow)?.Item.Id;
+                var selected = MailList.SelectedItems.OfType<MailRow>().Select(r => r.Item.Id).ToHashSet();
                 var messages = mail.OrderByDescending(m => m.Date).Select(m => new MailRow(m)).ToArray();
-                MailList.ItemsSource = messages;
-                MailList.SelectedItem = messages.FirstOrDefault(m => m.Item.Id == selected);
+                restoringMailSelection = true;
+                try
+                {
+                    MailList.ItemsSource = messages;
+                    foreach (var item in messages.Where(m => selected.Contains(m.Item.Id)))
+                        MailList.SelectedItems.Add(item);
+                }
+                finally { restoringMailSelection = false; }
                 allMail = mail;
             }
             MailEmpty.Text = !service.IsConnected ? "在设置中连接 Nextcloud 后，这里会显示收件箱。" :
@@ -281,6 +336,7 @@ public partial class MainWindow : Window
     {
         TaskStatus.Text = Status(tasksMessage, lastSync?.TasksLastSync);
         MailStatus.Text = Status(mailMessage, lastSync?.MailLastSync);
+        if (pendingMailOperations > 0) MailStatus.Text = $"{pendingMailOperations} 项邮件操作待同步 · " + MailStatus.Text;
         TaskStatus.ToolTip = TaskStatus.Text;
         MailStatus.ToolTip = MailStatus.Text;
         SyncNowButton.IsEnabled = service.IsConnected;
@@ -300,9 +356,31 @@ public partial class MainWindow : Window
         CompleteButton.Content = t?.Completed == true ? "恢复待办" : "标记完成";
         CompleteButton.IsEnabled = t?.CanWrite == true && t.SyncState != "conflict";
         ResolveButton.Visibility = t?.SyncState == "conflict" ? Visibility.Visible : Visibility.Collapsed;
-        ReadButton.IsEnabled = MailList.SelectedItem is MailRow && !readingMail;
-        CreateButton.IsEnabled = service.IsConnected && taskLists.Any(l => l.CanWrite);
+        var chosen = MailList.SelectedItems.OfType<MailRow>().ToArray();
+        ReadButton.IsEnabled = chosen.Length == 1 && !readingMail && !changingMail;
+        SelectMailButton.IsEnabled = MailList.Items.Count > 0 && !changingMail;
+        SelectMailButton.Content = chosen.Length > 0 && chosen.Length == MailList.Items.Count ? "取消全选" : "全选";
+        MarkReadButton.IsEnabled = !changingMail && chosen.Any(r => r.Item.Unread);
+        TrashButton.IsEnabled = !changingMail && chosen.Length != 0;
+        bool canCreate = service.IsConnected && QuickList.SelectedItem is TaskList;
+        QuickList.IsEnabled = canCreate && !savingQuickTask;
+        QuickTitle.IsEnabled = canCreate && !savingQuickTask;
+        CreateButton.IsEnabled = canCreate && !savingQuickTask && !string.IsNullOrWhiteSpace(QuickTitle.Text);
     }
+
+    private void SetThemeLabel()
+    {
+        ThemeButton.Content = preferences.State.DarkMode ? "日间" : "夜间";
+        ThemeButton.ToolTip = preferences.State.DarkMode ? "切换到日间主题" : "切换到夜间主题";
+    }
+    private void Theme_Click(object sender, RoutedEventArgs e)
+    {
+        var dark = !preferences.State.DarkMode;
+        preferences.Set(preferences.State with { DarkMode = dark });
+        WidgetTheme.Apply(dark);
+        SetThemeLabel();
+    }
+    private void Hide_Click(object sender, RoutedEventArgs e) { SavePosition(); Hide(); }
 
     private void Pin_Click(object sender, RoutedEventArgs e)
     {
@@ -323,7 +401,38 @@ public partial class MainWindow : Window
         try { settings.ShowDialog(); }
         finally { settings = null; }
     }
-    private void NewTask_Click(object sender, RoutedEventArgs e) => EditTask(null);
+    private void QuickTitle_Changed(object sender, TextChangedEventArgs e)
+    {
+        if (IsInitialized) UpdateButtons();
+    }
+    private void QuickTitle_KeyDown(object sender, KeyEventArgs e)
+    {
+        if (e.Key != Key.Enter || Keyboard.Modifiers != ModifierKeys.None) return;
+        e.Handled = true;
+        NewTask_Click(sender, e);
+    }
+    private async void NewTask_Click(object sender, RoutedEventArgs e)
+    {
+        string title = QuickTitle.Text.Trim();
+        if (title.Length == 0 || savingQuickTask || QuickList.SelectedItem is not TaskList { CanWrite: true } list) return;
+        savingQuickTask = true;
+        UpdateButtons();
+        try
+        {
+            await service.CreateTaskAsync(list.Id, title, "", null, accountWork.Token);
+            if (!smoke && preferences.State.LastTaskList != list.Id)
+                preferences.Set(preferences.State with { LastTaskList = list.Id });
+            QuickTitle.Clear();
+            if (ListFilter.SelectedItem is ListChoice filter && filter.Id.Length > 0 && filter.Id != list.Id)
+                ListFilter.SelectedItem = ListFilter.Items.OfType<ListChoice>().FirstOrDefault(l => l.Id == list.Id);
+            await ReloadAsync();
+            if (wasOnline && (tasksWork?.IsCompleted ?? true))
+                tasksWork = SyncSourceAsync(true, accountWork.Token);
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception ex) { WidgetPrompt.Show(this, ErrorText(ex), "待办保存失败"); }
+        finally { savingQuickTask = false; UpdateButtons(); QuickTitle.Focus(); }
+    }
     private void EditTask_Click(object sender, RoutedEventArgs e)
     {
         if (TasksList.SelectedItem is TaskRow row)
@@ -358,7 +467,7 @@ public partial class MainWindow : Window
                 await LocalChangeAsync(() => service.ResolveConflictAsync(row.Item.Id, dialog.KeepLocal, accountWork.Token));
         }
         catch (OperationCanceledException) { }
-        catch (Exception ex) { MessageBox.Show(this, ErrorText(ex), "无法打开冲突"); }
+        catch (Exception ex) { WidgetPrompt.Show(this, ErrorText(ex), "无法打开冲突"); }
     }
     private async Task LocalChangeAsync(Func<Task> edit)
     {
@@ -370,17 +479,58 @@ public partial class MainWindow : Window
                 tasksWork = SyncSourceAsync(true, accountWork.Token);
         }
         catch (OperationCanceledException) { }
-        catch (Exception ex) { MessageBox.Show(this, ErrorText(ex), "待办保存失败"); }
+        catch (Exception ex) { WidgetPrompt.Show(this, ErrorText(ex), "待办保存失败"); }
     }
     private static bool OnItem(ListBox list, MouseButtonEventArgs e) =>
         e.OriginalSource is DependencyObject element && ItemsControl.ContainerFromElement(list, element) is ListBoxItem;
     private void Mail_DoubleClick(object sender, MouseButtonEventArgs e)
     {
-        if (OnItem(MailList, e)) ReadMail_Click(sender, e);
+        if (!OnItem(MailList, e) || e.OriginalSource is not DependencyObject child) return;
+        for (var current = child; current is System.Windows.Media.Visual && current != MailList;
+             current = System.Windows.Media.VisualTreeHelper.GetParent(current))
+            if (current is CheckBox) return;
+        if (MailList.SelectedItems.Count == 1) ReadMail_Click(sender, e);
+    }
+    private void SelectMail_Click(object sender, RoutedEventArgs e)
+    {
+        if (MailList.Items.Count == MailList.SelectedItems.Count) MailList.UnselectAll();
+        else MailList.SelectAll();
+    }
+    private async void MarkRead_Click(object sender, RoutedEventArgs e)
+    {
+        var ids = MailList.SelectedItems.OfType<MailRow>().Where(r => r.Item.Unread).Select(r => r.Item.Id).ToArray();
+        await ChangeMailAsync(ids, false);
+    }
+    private async void Trash_Click(object sender, RoutedEventArgs e)
+    {
+        var ids = MailList.SelectedItems.OfType<MailRow>().Select(r => r.Item.Id).ToArray();
+        if (ids.Length > 0 && WidgetPrompt.ConfirmTrash(this, ids.Length)) await ChangeMailAsync(ids, true);
+    }
+    private async Task ChangeMailAsync(string[] ids, bool trash)
+    {
+        if (ids.Length == 0 || changingMail || stopped) return;
+        changingMail = true;
+        UpdateButtons();
+        try
+        {
+            if (trash) await service.MoveMailToTrashAsync(ids, accountWork.Token);
+            else await service.MarkMailReadAsync(ids, accountWork.Token);
+            await ReloadAsync();
+            if (wasOnline && (mailWork?.IsCompleted ?? true))
+                mailWork = SyncSourceAsync(false, accountWork.Token);
+            else if (mailWork is { IsCompleted: false }) mailEditedDuringSync = true;
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception ex)
+        {
+            mailMessage = "邮件操作失败 · " + ErrorText(ex);
+            ShowStatus();
+        }
+        finally { changingMail = false; UpdateButtons(); }
     }
     private async void ReadMail_Click(object sender, RoutedEventArgs e)
     {
-        if (MailList.SelectedItem is not MailRow row || readingMail) return;
+        if (MailList.SelectedItem is not MailRow row || MailList.SelectedItems.Count != 1 || readingMail || changingMail) return;
         readingMail = true;
         UpdateButtons();
         var token = accountWork.Token;
@@ -394,10 +544,14 @@ public partial class MainWindow : Window
                 body = await service.GetMailBodyAsync(row.Item.Id, token);
             }
             if (!stopped && !token.IsCancellationRequested)
-                new MailDialog(this, row.Item, string.IsNullOrWhiteSpace(body) ? "（正文为空）" : body).ShowDialog();
+            {
+                var reader = new MailDialog(this, row.Item, string.IsNullOrWhiteSpace(body) ? "（正文为空）" : body);
+                if (row.Item.Unread) reader.ContentRendered += async (_, _) => await ChangeMailAsync([row.Item.Id], false);
+                reader.ShowDialog();
+            }
         }
         catch (OperationCanceledException) { }
-        catch (Exception ex) { MessageBox.Show(this, ErrorText(ex), "邮件正文暂不可用"); }
+        catch (Exception ex) { WidgetPrompt.Show(this, ErrorText(ex), "邮件正文暂不可用"); }
         finally { readingMail = false; UpdateButtons(); ShowStatus(); }
     }
 
@@ -459,7 +613,7 @@ public partial class MainWindow : Window
     }
     private void EnsureEditorsClosed()
     {
-        if (OwnedWindows.OfType<TaskDialog>().Any(w => w.IsVisible))
+        if (savingQuickTask || !string.IsNullOrWhiteSpace(QuickTitle.Text) || OwnedWindows.OfType<TaskDialog>().Any(w => w.IsVisible))
             throw new InvalidOperationException("请先保存或关闭正在编辑的待办，再安装更新。");
     }
     internal void RestoreWindow()
@@ -471,8 +625,9 @@ public partial class MainWindow : Window
     }
     private void ExitApp()
     {
-        if (OwnedWindows.OfType<TaskDialog>().Any(w => w.IsVisible) &&
-            MessageBox.Show(this, "当前正在编辑待办。要放弃尚未保存的编辑并退出吗？", "退出小窗",
+        if (savingQuickTask) return;
+        if ((!string.IsNullOrWhiteSpace(QuickTitle.Text) || OwnedWindows.OfType<TaskDialog>().Any(w => w.IsVisible)) &&
+            WidgetPrompt.Show(this, "当前正在编辑待办。要放弃尚未保存的编辑并退出吗？", "退出小窗",
                 MessageBoxButton.YesNo, MessageBoxImage.Question, MessageBoxResult.No) != MessageBoxResult.Yes) return;
         Stop();
         Application.Current.Shutdown();
