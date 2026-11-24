@@ -57,7 +57,7 @@ try
     var current = new UpdateClient(http, expected.Version, stageParent.FullName);
     Assert(await current.CheckAsync() == null, "equal release offered");
     await RejectAsync(() => Task.Run(() => PublisherTrust.CheckExecutable(typeof(Program).Assembly.Location)));
-    Console.WriteLine("PASS: invalid manifest, corrupt/truncated asset, unsigned PE, same-version update");
+    Console.WriteLine("PASS: invalid manifest, corrupt/truncated asset, unrelated PE, same-version update");
 }
 finally { if (!stageParent.EnumerateFileSystemInfos().Any()) stageParent.Delete(); }
 

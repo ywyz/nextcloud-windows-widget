@@ -59,7 +59,9 @@ internal static class PublisherTrust
         }
         finally { Marshal.FreeCoTaskMem(file.Name); Marshal.FreeHGlobal(filePtr); }
         var info = FileVersionInfo.GetVersionInfo(path);
-        if (info.ProductName != ReleaseInfo.Product || info.FilePrivatePart != 0)
+        if (info.ProductName != ReleaseInfo.Product ||
+            !string.Equals(info.OriginalFilename, "NextcloudWidget-win-x64.dll", StringComparison.OrdinalIgnoreCase) ||
+            info.FilePrivatePart != 0)
             throw new InvalidDataException("更新文件的产品标识或版本不正确。");
         return new Version(info.FileMajorPart, info.FileMinorPart, info.FileBuildPart);
     }

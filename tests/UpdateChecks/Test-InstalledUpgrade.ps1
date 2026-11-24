@@ -1,4 +1,5 @@
 ﻿# Run with PowerShell 7 on Windows from the repository root.
+# Build tests/CoreChecks in Release before running this script.
 # -Public drives the old build's actual settings dialog against the published Release.
 [CmdletBinding()]
 param(
@@ -17,7 +18,7 @@ $exe = Join-Path $testDir 'NextcloudWidget-win-x64.exe'
 $profile = Join-Path $testDir 'data'
 $stage = Join-Path $testDir ('.nextcloud-widget-update-' + [guid]::NewGuid().ToString('N'))
 Copy-Item -LiteralPath $old -Destination $exe
-& $Dotnet run -c Release --project (Join-Path $repo 'tests/CoreChecks') -- --seed-update $profile
+& $Dotnet run -c Release --no-build --project (Join-Path $repo 'tests/CoreChecks') -- --seed-update $profile
 if ($LASTEXITCODE) { throw 'Cannot seed pending task.' }
 
 function Start-TestProcess([string]$file,[string[]]$arguments) {
@@ -87,7 +88,7 @@ try {
     } while ([DateTime]::UtcNow -lt $deadline)
     if ((Get-FileHash $exe -Algorithm SHA256).Hash -ne $expectedHash) { throw 'Installed binary hash differs.' }
     if (Get-ChildItem -LiteralPath $testDir -Recurse -Filter previous.exe) { throw 'New application never confirmed readiness.' }
-    & $Dotnet run -c Release --project (Join-Path $repo 'tests/CoreChecks') -- --verify-update $profile
+    & $Dotnet run -c Release --no-build --project (Join-Path $repo 'tests/CoreChecks') -- --verify-update $profile
     if ($LASTEXITCODE) { throw 'Pending task did not survive the upgrade.' }
     Write-Output "PASS installed upgrade (public=$Public rollback=$Rollback) $testDir"
 } finally {
