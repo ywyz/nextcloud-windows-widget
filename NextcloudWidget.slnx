@@ -1,0 +1,12 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/NextcloudWidget.App/NextcloudWidget.App.csproj" />
+    <Project Path="src/NextcloudWidget.Core/NextcloudWidget.Core.csproj" />
+    <Project Path="src/NextcloudWidget.Updates/NextcloudWidget.Updates.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/CoreChecks/CoreChecks.csproj" />
+    <Project Path="tests/Integration/NextcloudWidget.Integration.csproj" />
+    <Project Path="tests/UpdateChecks/UpdateChecks.csproj" />
+  </Folder>
+</Solution>

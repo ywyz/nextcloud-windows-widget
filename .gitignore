@@ -1,0 +1,13 @@
+**/bin/
+**/obj/
+.vs/
+artifacts/
+TestResults/
+*.user
+*.pfx
+*.p12
+*.sqlite*
+*.db
+*.db-shm
+*.db-wal
+.env
