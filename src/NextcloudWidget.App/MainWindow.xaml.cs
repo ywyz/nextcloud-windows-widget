@@ -143,7 +143,7 @@ public partial class MainWindow : Window
         if (DateTime.Today != displayedDay) PresentTasks();
         Sync(false);
         var now = DateTimeOffset.UtcNow;
-        if (!wasOnline || updateLock.CurrentCount == 0 || release != null || now < updateRetryAt ||
+        if (!wasOnline || updateLock.CurrentCount == 0 || now < updateRetryAt ||
             preferences.State.LastUpdateCheck > now.AddDays(-1)) return;
         updateRetryAt = now.AddHours(1);
         try { await CheckUpdatesAsync(lifetime.Token); }
@@ -429,10 +429,11 @@ public partial class MainWindow : Window
         await updateLock.WaitAsync(ct);
         try
         {
-            if (release == null) release = await updates.CheckAsync(ct);
+            // Assign only on success so failed refreshes preserve the last verified release.
+            release = await updates.CheckAsync(ct);
             preferences.Set(preferences.State with { LastUpdateCheck = DateTimeOffset.UtcNow });
             UpdateSettingsLabel();
-            if (release != null && tray != null) tray.Text = $"Nextcloud 小窗 · 有新版本 {release.Version}";
+            if (tray != null) tray.Text = release == null ? "Nextcloud 小窗" : $"Nextcloud 小窗 · 有新版本 {release.Version}";
         }
         finally { updateLock.Release(); }
     }
@@ -440,16 +441,21 @@ public partial class MainWindow : Window
         SettingsButton.Content = !service.IsConnected ? "连接 Nextcloud" : release == null ? "设置" : "设置 · 有更新";
     internal async Task InstallUpdateAsync(Version selectedVersion, CancellationToken ct)
     {
-        var selectedRelease = release;
-        if (selectedRelease == null || selectedRelease.Version != selectedVersion)
-            throw new InvalidOperationException("可用版本已改变，请重新检查更新。");
-        EnsureEditorsClosed();
-        var path = await updates.StageAsync(selectedRelease, ct);
-        ct.ThrowIfCancellationRequested();
-        EnsureEditorsClosed();
-        updates.BeginInstall(path);
-        Stop();
-        Application.Current.Shutdown();
+        await updateLock.WaitAsync(ct);
+        try
+        {
+            var selectedRelease = release;
+            if (selectedRelease == null || selectedRelease.Version != selectedVersion)
+                throw new InvalidOperationException("可用版本已改变，请重新检查更新。");
+            EnsureEditorsClosed();
+            var path = await updates.StageAsync(selectedRelease, ct);
+            ct.ThrowIfCancellationRequested();
+            EnsureEditorsClosed();
+            updates.BeginInstall(path);
+            Stop();
+            Application.Current.Shutdown();
+        }
+        finally { updateLock.Release(); }
     }
     private void EnsureEditorsClosed()
     {

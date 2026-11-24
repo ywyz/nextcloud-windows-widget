@@ -1,4 +1,4 @@
-﻿# Run with Windows PowerShell 5.1 from the repository root.
+﻿# Run with PowerShell 7 on Windows from the repository root.
 # -Public drives the old build's actual settings dialog against the published Release.
 [CmdletBinding()]
 param(

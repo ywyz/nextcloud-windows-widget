@@ -13,6 +13,7 @@ internal sealed class SettingsDialog : WidgetDialog
     private readonly Button account = new();
     private readonly Button reauthorize = new();
     private readonly Button update = new();
+    private readonly Button recheck = new();
     private readonly CancellationTokenSource lifetime = new();
     private Version? displayedUpdate;
     private bool working;
@@ -33,6 +34,8 @@ internal sealed class SettingsDialog : WidgetDialog
         var version = typeof(SettingsDialog).Assembly.GetName().Version;
         Fields.Children.Add(Text($"当前版本 {version?.ToString(3)}"));
         Configure(update, Update_Click);
+        Configure(recheck, Update_Click);
+        recheck.Content = "重新检查更新";
         ActionButton("关闭", (_, _) => Close()).IsCancel = true;
         Closed += (_, _) => lifetime.Cancel();
         RefreshButtons();
@@ -50,10 +53,11 @@ internal sealed class SettingsDialog : WidgetDialog
     {
         address.IsReadOnly = service.IsConnected || working;
         account.Content = service.IsConnected ? "断开并清除此账户缓存" : "在浏览器中授权";
-        account.IsEnabled = reauthorize.IsEnabled = update.IsEnabled = !working;
+        account.IsEnabled = reauthorize.IsEnabled = update.IsEnabled = recheck.IsEnabled = !working;
         reauthorize.Visibility = service.IsConnected ? Visibility.Visible : Visibility.Collapsed;
         displayedUpdate = host.AvailableVersion;
         update.Content = displayedUpdate == null ? "检查更新" : $"安装 {displayedUpdate.ToString(3)}";
+        recheck.Visibility = displayedUpdate == null ? Visibility.Collapsed : Visibility.Visible;
     }
 
     private async void Account_Click(object sender, RoutedEventArgs e)
@@ -113,7 +117,7 @@ internal sealed class SettingsDialog : WidgetDialog
     private async void Update_Click(object sender, RoutedEventArgs e)
     {
         if (working) return;
-        var selectedVersion = displayedUpdate;
+        var selectedVersion = ReferenceEquals(sender, update) ? displayedUpdate : null;
         working = true;
         RefreshButtons();
         try
