@@ -40,6 +40,8 @@ public partial class MainWindow : Window
     private readonly WidgetService service;
     private readonly Preferences preferences;
     private readonly bool smoke;
+    private bool maintainDesktopShortcut;
+    private bool reportedShortcutFailure;
     private readonly UpdateClient updates = new();
     private readonly SemaphoreSlim updateLock = new(1, 1);
     private readonly SemaphoreSlim cacheRead = new(1, 1);
@@ -48,6 +50,7 @@ public partial class MainWindow : Window
     private readonly DispatcherTimer timer = new() { Interval = TimeSpan.FromSeconds(30) };
     private readonly DispatcherTimer cacheTimer = new() { Interval = TimeSpan.FromSeconds(3) };
     private Forms.NotifyIcon? tray;
+    private System.Drawing.Icon? trayIcon;
     private SettingsDialog? settings;
     private IReadOnlyList<TaskItem> allTasks = Array.Empty<TaskItem>();
     private IReadOnlyList<MailItem> allMail = Array.Empty<MailItem>();
@@ -66,11 +69,12 @@ public partial class MainWindow : Window
     internal Version? AvailableVersion => release?.Version;
     internal string DataDirectory => preferences.DirectoryPath;
 
-    internal MainWindow(WidgetService service, Preferences preferences, bool smoke)
+    internal MainWindow(WidgetService service, Preferences preferences, bool smoke, bool maintainDesktopShortcut)
     {
         this.service = service;
         this.preferences = preferences;
         this.smoke = smoke;
+        this.maintainDesktopShortcut = maintainDesktopShortcut;
         WidgetTheme.Apply(preferences.State.DarkMode);
         InitializeComponent();
         SetThemeLabel();
@@ -145,7 +149,10 @@ public partial class MainWindow : Window
         menu.Items.Add("设置", null, (_, _) => OpenSettings_Click(this, new RoutedEventArgs()));
         menu.Items.Add(new Forms.ToolStripSeparator());
         menu.Items.Add("退出", null, (_, _) => ExitApp());
-        tray = new Forms.NotifyIcon { Text = "Nextcloud 小窗", Icon = System.Drawing.SystemIcons.Application,
+        using var iconStream = Application.GetResourceStream(new Uri("Assets/Widget.ico", UriKind.Relative)).Stream;
+        using var resourceIcon = new System.Drawing.Icon(iconStream, Forms.SystemInformation.SmallIconSize);
+        trayIcon = (System.Drawing.Icon)resourceIcon.Clone();
+        tray = new Forms.NotifyIcon { Text = "Nextcloud 小窗", Icon = trayIcon,
             ContextMenuStrip = menu, Visible = true };
         tray.MouseClick += (_, e) => { if (e.Button == Forms.MouseButtons.Left) RestoreWindow(); };
     }
@@ -380,7 +387,29 @@ public partial class MainWindow : Window
         WidgetTheme.Apply(dark);
         SetThemeLabel();
     }
-    private void Hide_Click(object sender, RoutedEventArgs e) { SavePosition(); Hide(); }
+    private void Hide_Click(object sender, RoutedEventArgs e) => HideToTray();
+    internal void EnableDesktopShortcut() => maintainDesktopShortcut = true;
+
+    private void HideToTray()
+    {
+        EnsureDesktopShortcut();
+        SavePosition();
+        Hide();
+    }
+
+    private void EnsureDesktopShortcut()
+    {
+        if (!maintainDesktopShortcut) return;
+        try { DesktopShortcut.EnsureForCurrentUser(); }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or
+            System.Runtime.InteropServices.COMException or System.Security.SecurityException)
+        {
+            if (reportedShortcutFailure) return;
+            reportedShortcutFailure = true;
+            MessageBox.Show("无法写入桌面快捷方式。仍可通过托盘或原来的 EXE 打开小窗。", "Nextcloud 小窗",
+                MessageBoxButton.OK, MessageBoxImage.Warning);
+        }
+    }
 
     private void Pin_Click(object sender, RoutedEventArgs e)
     {
@@ -578,13 +607,16 @@ public partial class MainWindow : Window
             await ReloadAsync();
         }
     }
-    internal async Task CheckUpdatesAsync(CancellationToken ct)
+    internal async Task CheckUpdatesAsync(CancellationToken ct, IProgress<UpdateProgress>? progress = null)
     {
         await updateLock.WaitAsync(ct);
         try
         {
             // Assign only on success so failed refreshes preserve the last verified release.
-            release = await updates.CheckAsync(ct);
+            var candidate = await Task.Run(() => progress == null
+                ? updates.CheckAsync(ct) : updates.CheckAsync(progress, ct), ct);
+            ct.ThrowIfCancellationRequested();
+            release = candidate;
             preferences.Set(preferences.State with { LastUpdateCheck = DateTimeOffset.UtcNow });
             UpdateSettingsLabel();
             if (tray != null) tray.Text = release == null ? "Nextcloud 小窗" : $"Nextcloud 小窗 · 有新版本 {release.Version}";
@@ -593,23 +625,38 @@ public partial class MainWindow : Window
     }
     private void UpdateSettingsLabel() =>
         SettingsButton.Content = !service.IsConnected ? "连接 Nextcloud" : release == null ? "设置" : "设置 · 有更新";
-    internal async Task InstallUpdateAsync(Version selectedVersion, CancellationToken ct)
+    internal async Task InstallUpdateAsync(Version selectedVersion, CancellationToken ct, IProgress<UpdateProgress>? progress = null,
+        Action? preparingRestart = null)
     {
         await updateLock.WaitAsync(ct);
+        string? staged = null;
         try
         {
             var selectedRelease = release;
             if (selectedRelease == null || selectedRelease.Version != selectedVersion)
                 throw new InvalidOperationException("可用版本已改变，请重新检查更新。");
             EnsureEditorsClosed();
-            var path = await updates.StageAsync(selectedRelease, ct);
+            staged = await Task.Run(() => progress == null
+                ? updates.StageAsync(selectedRelease, ct) : updates.StageAsync(selectedRelease, progress, ct), ct);
             ct.ThrowIfCancellationRequested();
             EnsureEditorsClosed();
-            updates.BeginInstall(path);
+            string ready = staged;
+            preparingRestart?.Invoke();
+            await Task.Run(() => updates.BeginInstall(ready, ct), ct);
+            // Once the helper starts it owns this directory and waits for this process to exit.
+            staged = null;
             Stop();
             Application.Current.Shutdown();
         }
-        finally { updateLock.Release(); }
+        finally
+        {
+            try
+            {
+                if (staged is string unused)
+                    await Task.Run(() => updates.AbandonStaged(unused));
+            }
+            finally { updateLock.Release(); }
+        }
     }
     private void EnsureEditorsClosed()
     {
@@ -629,6 +676,7 @@ public partial class MainWindow : Window
         if ((!string.IsNullOrWhiteSpace(QuickTitle.Text) || OwnedWindows.OfType<TaskDialog>().Any(w => w.IsVisible)) &&
             WidgetPrompt.Show(this, "当前正在编辑待办。要放弃尚未保存的编辑并退出吗？", "退出小窗",
                 MessageBoxButton.YesNo, MessageBoxImage.Question, MessageBoxResult.No) != MessageBoxResult.Yes) return;
+        EnsureDesktopShortcut();
         Stop();
         Application.Current.Shutdown();
     }
@@ -637,8 +685,7 @@ public partial class MainWindow : Window
         if (!stopped && !smoke)
         {
             e.Cancel = true;
-            SavePosition();
-            Hide();
+            HideToTray();
         }
         base.OnClosing(e);
     }
@@ -659,6 +706,7 @@ public partial class MainWindow : Window
         accountWork.Cancel();
         service.Dispose();
         if (tray != null) { tray.Visible = false; tray.ContextMenuStrip?.Dispose(); tray.Dispose(); }
+        trayIcon?.Dispose();
     }
     internal void CheckControls()
     {

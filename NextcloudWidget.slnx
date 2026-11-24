@@ -7,6 +7,7 @@
   <Folder Name="/tests/">
     <Project Path="tests/CoreChecks/CoreChecks.csproj" />
     <Project Path="tests/Integration/NextcloudWidget.Integration.csproj" />
+    <Project Path="tests/ShortcutChecks/ShortcutChecks.csproj" />
     <Project Path="tests/TranslationChecks/TranslationChecks.csproj" />
     <Project Path="tests/UpdateChecks/UpdateChecks.csproj" />
   </Folder>

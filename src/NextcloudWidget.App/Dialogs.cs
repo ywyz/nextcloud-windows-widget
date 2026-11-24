@@ -13,6 +13,7 @@ internal class WidgetDialog : Window
     protected WidgetDialog(Window owner, string title, double width, double height)
     {
         Owner = owner;
+        Icon = owner.Icon;
         SetResourceReference(BackgroundProperty, "CanvasBrush");
         SetResourceReference(ForegroundProperty, "TextBrush");
         WindowStartupLocation = WindowStartupLocation.CenterOwner;

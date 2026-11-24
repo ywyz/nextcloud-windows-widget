@@ -28,10 +28,19 @@ await RejectAsync(() => Task.Run(() => PublisherTrust.CheckManifest(sample, forg
 Console.WriteLine("PASS: manifest shape and rejection of foreign signers");
 
 if (args.Length == 0) return;
+if (args[0] == "--public-transfer")
+{
+    if (args.Length > 2) throw new ArgumentException("Usage: --public-transfer [expected-version]");
+    await PublicTransfer.RunAsync(args.Length == 2 ? Version.Parse(args[1]) : null);
+    return;
+}
 string releaseDir = Path.GetFullPath(args[0]);
 string asset = Path.Combine(releaseDir, ReleaseInfo.Asset);
 var expected = ReleaseInfo.Parse(await File.ReadAllBytesAsync(Path.Combine(releaseDir, "update-win-x64.json")));
+var trustTime = System.Diagnostics.Stopwatch.StartNew();
 Assert(PublisherTrust.CheckExecutable(asset) == expected.Version, "signed executable version");
+Console.WriteLine($"Windows trust, pinned signer, product and version verified in {trustTime.ElapsedMilliseconds} ms.");
+await TransferChecks.RunAsync(releaseDir, expected);
 var stageParent = Directory.CreateTempSubdirectory("widget-update-test-");
 try
 {
@@ -47,6 +56,15 @@ try
     Console.WriteLine("PASS: signed manifest, fallback to origin, Authenticode, product and size");
 
     handler.FailMirror = false;
+    var checkProgress = new List<UpdateProgress>();
+    int previousDirect = handler.DirectHits;
+    Assert(await updater.CheckAsync(new RecordedProgress(checkProgress), default) != null &&
+        handler.DirectHits == previousDirect &&
+        checkProgress.Select(x => x.Phase).SequenceEqual([UpdatePhase.Checking, UpdatePhase.Verifying]) &&
+        checkProgress.All(x => x.Source == UpdateSource.Accelerator), "healthy mirror check should verify without direct requests");
+    handler.MissingSignature = true;
+    await RejectAsync(() => updater.CheckAsync());
+    handler.MissingSignature = false;
     handler.BadSignature = true;
     await RejectAsync(() => updater.CheckAsync());
     handler.BadSignature = false;
@@ -63,7 +81,7 @@ finally { if (!stageParent.EnumerateFileSystemInfos().Any()) stageParent.Delete(
 
 sealed class FixtureHandler(string releaseDir) : HttpMessageHandler
 {
-    public bool FailMirror, BadSignature, BadAsset;
+    public bool FailMirror, BadSignature, BadAsset, MissingSignature;
     public int MirrorHits, DirectHits;
     protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)
     {
@@ -71,8 +89,14 @@ sealed class FixtureHandler(string releaseDir) : HttpMessageHandler
         if (mirror) Interlocked.Increment(ref MirrorHits); else Interlocked.Increment(ref DirectHits);
         if (mirror && FailMirror) return Task.FromResult(new HttpResponseMessage(HttpStatusCode.BadGateway));
         var name = Path.GetFileName(request.RequestUri.AbsolutePath);
+        if (MissingSignature && name.EndsWith(".p7s")) return Task.FromResult(new HttpResponseMessage(HttpStatusCode.NotFound));
         HttpContent response = (BadSignature && name.EndsWith(".p7s")) || (BadAsset && name.EndsWith(".exe"))
             ? new ByteArrayContent([9,1,0]) : new StreamContent(File.OpenRead(Path.Combine(releaseDir, name)));
         return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = response });
     }
+}
+
+sealed class RecordedProgress(List<UpdateProgress> entries) : IProgress<UpdateProgress>
+{
+    public void Report(UpdateProgress value) => entries.Add(value);
 }

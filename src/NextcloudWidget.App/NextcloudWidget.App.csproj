@@ -5,6 +5,7 @@
     <UseWPF>true</UseWPF>
     <UseWindowsForms>true</UseWindowsForms>
     <AssemblyName>NextcloudWidget-win-x64</AssemblyName>
+    <ApplicationIcon>Assets/Widget.ico</ApplicationIcon>
     <RootNamespace>NextcloudWidget.App</RootNamespace>
     <ImplicitUsings>disable</ImplicitUsings>
     <Nullable>enable</Nullable>
@@ -13,6 +14,8 @@
     <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
   </PropertyGroup>
   <ItemGroup>
+    <Resource Include="Assets/Widget.ico" />
+    <Resource Include="Assets/Widget.png" />
     <ProjectReference Include="../NextcloudWidget.Core/NextcloudWidget.Core.csproj" />
     <ProjectReference Include="../NextcloudWidget.Updates/NextcloudWidget.Updates.csproj" />
   </ItemGroup>

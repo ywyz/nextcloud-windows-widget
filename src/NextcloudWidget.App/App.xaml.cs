@@ -35,7 +35,8 @@ public partial class App : Application
                 Shutdown();
                 return;
             }
-            var window = new MainWindow(new WidgetService(directory), new Preferences(directory), smoke);
+            var window = new MainWindow(new WidgetService(directory), new Preferences(directory), smoke,
+                DesktopShortcut.IsUserSession(e.Args));
             MainWindow = window;
             window.Show();
             await window.InitializeAsync();
@@ -48,7 +49,9 @@ public partial class App : Application
                 Shutdown(0);
                 return;
             }
-            UpdateClient.SignalHealthy(e.Args);
+            bool updated = UpdateClient.TrySignalHealthy(e.Args);
+            if (updated && DesktopShortcut.IsUserSession(e.Args, updateHandshake: true))
+                window.EnableDesktopShortcut();
             window.StartBackgroundWork();
         }
         catch (Exception ex)

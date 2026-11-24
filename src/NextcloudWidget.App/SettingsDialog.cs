@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Windows.Automation;
 using NextcloudWidget.Core;
 using NextcloudWidget.Updates;
 
@@ -14,6 +15,13 @@ internal sealed class SettingsDialog : WidgetDialog
     private readonly Button reauthorize = new();
     private readonly Button update = new();
     private readonly Button recheck = new();
+    private readonly Button translation = new() { Content = "配置翻译模型…" };
+    private readonly Button cancelUpdate = new() { Content = "取消更新", Visibility = Visibility.Collapsed };
+    private readonly TextBlock updateStatus = Text("");
+    private readonly TextBlock transferDetails = Text("", 12);
+    private readonly ProgressBar updateProgress = new() { Minimum = 0, Maximum = 100, Height = 7,
+        Margin = new Thickness(0, 0, 0, 5), Visibility = Visibility.Collapsed };
+    private CancellationTokenSource? updateOperation;
     private readonly CancellationTokenSource lifetime = new();
     private Version? displayedUpdate;
     private bool working;
@@ -31,34 +39,46 @@ internal sealed class SettingsDialog : WidgetDialog
         feedback.Margin = new Thickness(0, 9, 0, 12);
         Fields.Children.Add(feedback);
         Fields.Children.Add(Text("邮件翻译", 19));
-        var translation = new Button { Content = "配置翻译模型…" };
         System.Windows.Automation.AutomationProperties.SetAutomationId(translation, "TranslationSettingsButton");
         Configure(translation, (_, _) => new TranslationSettingsDialog(this,
             new TranslationPreferences(host.DataDirectory)).ShowDialog());
         Fields.Children.Add(Text("软件更新", 19));
         var version = typeof(SettingsDialog).Assembly.GetName().Version;
         Fields.Children.Add(Text($"当前版本 {version?.ToString(3)}"));
-        Configure(update, Update_Click);
-        Configure(recheck, Update_Click);
+        var updateButtons = new WrapPanel();
+        Fields.Children.Add(updateButtons);
+        Configure(update, Update_Click, updateButtons);
+        Configure(recheck, Update_Click, updateButtons);
+        Configure(cancelUpdate, CancelUpdate_Click, updateButtons);
         recheck.Content = "重新检查更新";
+        updateStatus.Margin = new Thickness(0, 6, 0, 5);
+        updateStatus.Visibility = transferDetails.Visibility = Visibility.Collapsed;
+        foreach (var (control, id) in new (FrameworkElement, string)[] {
+            (update, "UpdateAction"), (recheck, "RecheckUpdate"), (cancelUpdate, "CancelUpdate"),
+            (updateStatus, "UpdateStatus"), (updateProgress, "UpdateProgress"), (transferDetails, "UpdateTransfer") })
+            AutomationProperties.SetAutomationId(control, id);
+        AutomationProperties.SetName(updateProgress, "更新进度");
+        Fields.Children.Add(updateStatus);
+        Fields.Children.Add(updateProgress);
+        Fields.Children.Add(transferDetails);
         ActionButton("关闭", (_, _) => Close()).IsCancel = true;
         Closed += (_, _) => lifetime.Cancel();
         RefreshButtons();
     }
 
-    private void Configure(Button button, RoutedEventHandler click)
+    private void Configure(Button button, RoutedEventHandler click, Panel? parent = null)
     {
         button.HorizontalAlignment = HorizontalAlignment.Left;
-        button.Margin = new Thickness(0, 5, 0, 0);
+        button.Margin = new Thickness(0, 5, 6, 0);
         button.Padding = new Thickness(10, 5, 10, 5);
         button.Click += click;
-        Fields.Children.Add(button);
+        (parent ?? Fields).Children.Add(button);
     }
     private void RefreshButtons()
     {
         address.IsReadOnly = service.IsConnected || working;
         account.Content = service.IsConnected ? "断开并清除此账户缓存" : "在浏览器中授权";
-        account.IsEnabled = reauthorize.IsEnabled = update.IsEnabled = recheck.IsEnabled = !working;
+        account.IsEnabled = reauthorize.IsEnabled = update.IsEnabled = recheck.IsEnabled = translation.IsEnabled = !working;
         reauthorize.Visibility = service.IsConnected ? Visibility.Visible : Visibility.Collapsed;
         displayedUpdate = host.AvailableVersion;
         update.Content = displayedUpdate == null ? "检查更新" : $"安装 {displayedUpdate.ToString(3)}";
@@ -124,24 +144,111 @@ internal sealed class SettingsDialog : WidgetDialog
     {
         if (working) return;
         var selectedVersion = ReferenceEquals(sender, update) ? displayedUpdate : null;
+        using var operation = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token);
+        updateOperation = operation;
         working = true;
         RefreshButtons();
+        updateStatus.Visibility = updateProgress.Visibility = cancelUpdate.Visibility = Visibility.Visible;
+        cancelUpdate.IsEnabled = true;
+        updateProgress.IsIndeterminate = true;
+        updateProgress.Value = 0;
+        transferDetails.Text = "";
+        transferDetails.Visibility = Visibility.Collapsed;
+        updateStatus.Text = selectedVersion == null ? "正在检查更新…" : $"正在准备下载 {selectedVersion.ToString(3)}…";
+        updateProgress.BringIntoView();
+        string? retryNote = null;
+        bool preparingRestart = false;
+        var progress = new Progress<UpdateProgress>(state =>
+        {
+            if (!ReferenceEquals(updateOperation, operation) || operation.IsCancellationRequested || preparingRestart) return;
+            if (state.Phase == UpdatePhase.FallingBack)
+                retryNote = string.IsNullOrEmpty(state.Detail) ? "加速器不可用" : $"加速器请求失败（{state.Detail}）";
+            else if (state.Phase == UpdatePhase.Retrying)
+                retryNote = state.Detail;
+            ShowProgress(state, retryNote);
+        });
         try
         {
             if (selectedVersion == null)
             {
-                feedback.Text = "正在检查更新…";
-                await host.CheckUpdatesAsync(lifetime.Token);
-                feedback.Text = host.AvailableVersion == null ? "当前已是最新版本。" : "发现新版本，点击安装即可更新。";
+                await host.CheckUpdatesAsync(operation.Token, progress);
+                updateStatus.Text = host.AvailableVersion == null ? "当前已是最新版本。" :
+                    $"发现新版本 {host.AvailableVersion.ToString(3)}，点击安装即可下载。";
             }
             else
             {
-                feedback.Text = "正在下载安装包并验证签名…";
-                await host.InstallUpdateAsync(selectedVersion, lifetime.Token);
+                await host.InstallUpdateAsync(selectedVersion, operation.Token, progress, () =>
+                {
+                    preparingRestart = true;
+                    updateProgress.IsIndeterminate = true;
+                    transferDetails.Visibility = Visibility.Collapsed;
+                    updateStatus.Text = "正在复核当前程序与新版的 Windows 签名，准备重启小窗…";
+                });
             }
         }
-        catch (OperationCanceledException) { if (!lifetime.IsCancellationRequested) feedback.Text = "检查更新超时。"; }
-        catch (Exception ex) { feedback.Text = "更新失败。 " + MainWindow.ErrorText(ex); }
-        finally { working = false; RefreshButtons(); }
+        catch (OperationCanceledException)
+        {
+            if (!lifetime.IsCancellationRequested)
+                updateStatus.Text = operation.IsCancellationRequested ? "已取消本次更新操作。" : "更新请求超时，请重试。";
+        }
+        catch (Exception ex) { updateStatus.Text = "更新失败。 " + MainWindow.ErrorText(ex); }
+        finally
+        {
+            updateOperation = null;
+            updateProgress.Visibility = transferDetails.Visibility = cancelUpdate.Visibility = Visibility.Collapsed;
+            working = false;
+            RefreshButtons();
+        }
     }
+
+    private async void CancelUpdate_Click(object sender, RoutedEventArgs e)
+    {
+        if (updateOperation is not { IsCancellationRequested: false } operation) return;
+        cancelUpdate.IsEnabled = false;
+        updateStatus.Text = "正在取消，等待当前步骤结束…";
+        updateProgress.IsIndeterminate = true;
+        await operation.CancelAsync();
+    }
+
+    private void ShowProgress(UpdateProgress state, string? retryNote)
+    {
+        string source = state.Source == UpdateSource.Accelerator ? "GitHub 加速器" : "GitHub 直连";
+        string phase = state.Phase switch
+        {
+            UpdatePhase.Checking => "正在检查更新",
+            UpdatePhase.Downloading => "正在下载安装包",
+            UpdatePhase.Verifying => state.Detail ?? "正在验证更新",
+            UpdatePhase.Retrying => "正在重试",
+            UpdatePhase.FallingBack => "正在切换下载来源",
+            _ => "正在更新"
+        };
+        updateStatus.Text = $"{phase} · {source}";
+        var details = new List<string>();
+        updateProgress.IsIndeterminate = state.Phase != UpdatePhase.Downloading || state.TotalBytes is not > 0;
+        if (state.Phase == UpdatePhase.Downloading)
+        {
+            if (state.TotalBytes is > 0)
+            {
+                double percent = Math.Clamp(state.BytesReceived * 100d / state.TotalBytes.Value, 0, 100);
+                updateProgress.Value = percent;
+                details.Add($"{percent:0}%   {Size(state.BytesReceived)} / {Size(state.TotalBytes.Value)}");
+            }
+            else details.Add($"已下载 {Size(state.BytesReceived)}");
+            if (double.IsFinite(state.BytesPerSecond) && state.BytesPerSecond > 0)
+                details.Add($"{Size(state.BytesPerSecond)}/秒");
+            else if (state.TotalBytes is long size && state.BytesReceived < size)
+                details.Add("等待数据");
+        }
+        if (state.Attempt > 1) details.Add($"第 {state.Attempt} 次尝试");
+        if (!string.IsNullOrWhiteSpace(retryNote)) details.Add(retryNote);
+        transferDetails.Text = string.Join(" · ", details);
+        transferDetails.Visibility = details.Count == 0 ? Visibility.Collapsed : Visibility.Visible;
+    }
+    private static string Size(double bytes) => bytes switch
+    {
+        >= 1_000_000_000 => $"{bytes / 1_000_000_000:0.0} GB",
+        >= 1_000_000 => $"{bytes / 1_000_000:0.0} MB",
+        >= 1_000 => $"{bytes / 1_000:0} KB",
+        _ => $"{bytes:0} B"
+    };
 }

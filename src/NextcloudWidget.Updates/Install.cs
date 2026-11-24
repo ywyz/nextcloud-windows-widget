@@ -5,17 +5,52 @@ namespace NextcloudWidget.Updates;
 public sealed partial class UpdateClient
 {
     private const string StagePrefix = ".nextcloud-widget-update-";
+    private static readonly object StageGate = new();
 
-    public void BeginInstall(string stagedExe)
+    public void BeginInstall(string stagedExe) => BeginInstall(stagedExe, CancellationToken.None);
+
+    public void BeginInstall(string stagedExe, CancellationToken ct)
     {
-        string stage = Path.GetDirectoryName(Path.GetFullPath(stagedExe))!;
-        ValidateStage(stage, Path.GetDirectoryName(Executable)!);
-        if (Path.GetFileName(stagedExe) != ReleaseInfo.Asset ||
-            PublisherTrust.CheckExecutable(stagedExe) <= PublisherTrust.CheckExecutable(Executable))
+        ct.ThrowIfCancellationRequested();
+        string stage = ValidateStagedFile(stagedExe);
+        var version = PublisherTrust.CheckExecutable(stagedExe);
+        ct.ThrowIfCancellationRequested();
+        if (version <= PublisherTrust.CheckExecutable(Executable))
             throw new InvalidDataException("更新版本不匹配。");
-        string helper = Path.Combine(stage, "installer.exe");
-        File.Copy(Executable, helper);
-        using var process = Launch(helper, ["--apply-widget-update", Environment.ProcessId.ToString(), Executable, .. DataDirectoryArguments()]);
+        lock (StageGate)
+        {
+            ct.ThrowIfCancellationRequested();
+            ValidateStagedFile(stagedExe);
+            string helper = Path.Combine(stage, "installer.exe");
+            File.Copy(Executable, helper);
+            try
+            {
+                ct.ThrowIfCancellationRequested();
+                using var process = Launch(helper, ["--apply-widget-update", Environment.ProcessId.ToString(), Executable, .. DataDirectoryArguments()]);
+            }
+            catch { TryDelete(helper); throw; }
+        }
+    }
+
+    public void AbandonStaged(string stagedExe)
+    {
+        lock (StageGate)
+        {
+            string stage = ValidateStagedFile(stagedExe);
+            if (File.Exists(Path.Combine(stage, "installer.exe")) || File.Exists(Path.Combine(stage, "previous.exe")))
+                throw new InvalidOperationException("安装助手正在使用此目录。");
+            CleanStaging(stage);
+        }
+    }
+
+    private string ValidateStagedFile(string stagedExe)
+    {
+        string full = Path.GetFullPath(stagedExe);
+        string stage = Path.GetDirectoryName(full)!;
+        ValidateStage(stage, parentDirectory);
+        if (Path.GetFileName(full) != ReleaseInfo.Asset || (File.GetAttributes(full) & FileAttributes.ReparsePoint) != 0)
+            throw new InvalidDataException("临时更新包文件名或位置无效。");
+        return stage;
     }
 
     public static bool RunMaintenance(string[] args, out int exitCode)
@@ -77,11 +112,14 @@ public sealed partial class UpdateClient
         finally { child?.Dispose(); }
     }
 
-    public static void SignalHealthy(string[] args)
+    public static void SignalHealthy(string[] args) => TrySignalHealthy(args);
+
+    public static bool TrySignalHealthy(string[] args)
     {
-        if (args.Length < 2 || args[0] != "--updated" || !Guid.TryParseExact(args[1], "N", out _)) return;
+        if (args.Length < 2 || args[0] != "--updated" || !Guid.TryParseExact(args[1], "N", out _)) return false;
         if (EventWaitHandle.TryOpenExisting(EventName(args[1]), out var ready))
-            using (ready) ready.Set();
+            using (ready) return ready.Set();
+        return false;
     }
 
     private static string EventName(string token) => @"Local\NextcloudWidgetReady-" + token;
