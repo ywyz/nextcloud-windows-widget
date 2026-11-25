@@ -3,6 +3,7 @@ using System.Security.Cryptography;
 using System.Text.Json;
 using AngleSharp.Html.Parser;
 using NextcloudWidget.Core;
+using NextcloudWidget.Core.Mail;
 
 static string Required(string name) =>
     Environment.GetEnvironmentVariable(name) ?? throw new InvalidOperationException("Run tests/Integration/run-live.sh.");
@@ -109,11 +110,40 @@ try
             $"Recent message window incorrect for {user}.");
     }
     Check(mail.All(m => m.Unread && m.Sender.Contains("sender@fixture.test") &&
-        m.Body.Contains("手册") && m.Body.Contains("https://example.test/manual") && !m.Body.Contains("<a ")),
-        "Unread state, sender, safe text or link target missing.");
+        m.Body.Contains("手册") && !m.Body.Contains("https://example.test/manual") && !m.Body.Contains("<a ")),
+        "Unread state, sender or compact plain-text content incorrect.");
+    var newsletterId = mail.Single(m => m.Subject == "fixture-one-51").Id;
+    var newsletter = await primary.GetMailContentAsync(newsletterId);
+    string photoPart;
+    byte[] photo;
+    using (var document = new HtmlParser().ParseDocument(newsletter.Html))
+    {
+        Check(document.QuerySelector("a[href='https://example.test/manual']")?.TextContent == "手册",
+            "Reader lost the link behind the displayed label.");
+        var attachment = document.QuerySelector("img[alt='当年的照片']")?.GetAttribute("src");
+        Check(Uri.TryCreate(server, attachment, out var url) &&
+            url.AbsolutePath.Contains($"/messages/{newsletterId}/attachment/", StringComparison.Ordinal),
+            "Nextcloud did not return the embedded photo for the newsletter.");
+        photoPart = url!.Segments[^1];
+        photo = await primary.GetMailInlineImageAsync(newsletterId, photoPart);
+        Check(Convert.ToHexStringLower(SHA256.HashData(photo)) ==
+            "9469c2b6235fff73c3e8d839912a3a1800427bf9abe3560844d187664b803062",
+            "Embedded photo differs from the original SMTP attachment.");
+        var remoteImage = document.QuerySelector("img[alt='远程照片']");
+        var remoteSource = remoteImage?.GetAttribute("data-original-src") ?? remoteImage?.GetAttribute("src");
+        Check(remoteSource != null && MailImages.Resolve(remoteSource, server, newsletterId) ==
+            new MailImageSource(MailImageKind.Remote, "https://example.test/album.png"),
+            "Cannot recover the remote photo URL from the real Nextcloud Mail response.");
+    }
     await primary.SyncMailAsync();
     Check((await primary.GetMailAsync()).All(m => m.Unread), "Background prefetch marked IMAP messages as read.");
     using var offline = Open("primary", true);
+    Check((await offline.GetMailContentAsync(newsletterId)).Html == newsletter.Html,
+        "Illustrated newsletter markup did not survive an offline restart.");
+    var offlinePhoto = await offline.GetMailInlineImageAsync(newsletterId, photoPart);
+    Check(photo.SequenceEqual(offlinePhoto),
+        "Previously opened inline photo was unavailable after restarting offline.");
+    Console.WriteLine("PASS HTML newsletter with a real CID attachment and an offline photo after restart.");
     Check((await offline.GetMailAsync()).Count == 100, "Mail cache unavailable offline.");
     Check((await offline.GetMailBodyAsync(mail[0].Id)) == mail[0].Body, "Body was not available offline.");
     Check((await offline.GetTasksAsync()).Any(t => t.Id == taskId), "Task cache unavailable offline.");

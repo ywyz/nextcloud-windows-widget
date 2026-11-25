@@ -9,7 +9,7 @@ public sealed class ReleaseInfo
     public long Size { get; }
     public string Sha256 { get; }
     internal const string Product = "Nextcloud Windows Widget";
-    internal const string Asset = "NextcloudWidget-win-x64.exe";
+    public const string Asset = "NextcloudWidget-win-x64.exe";
     internal const string Repository = "https://github.com/ywyz/nextcloud-windows-widget";
     internal string DownloadUrl => $"{Repository}/releases/download/v{Version}/{Asset}";
 

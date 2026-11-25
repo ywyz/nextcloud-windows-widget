@@ -24,6 +24,11 @@ internal static class Program
         var shell = Activator.CreateInstance(Type.GetTypeFromProgID("WScript.Shell",true)!)!;
         try
         {
+            PortableLocationChecks.Run(root.FullName);
+            string downloads = Path.Combine(root.FullName, "下载");
+            Check(PortableLocation.IsInside(downloads, Path.Combine(downloads, "sub", "widget.exe")) &&
+                !PortableLocation.IsInside(downloads, Path.Combine(downloads + "-archive", "widget.exe")),
+                "recognizes nested and redirected download paths without matching sibling folders");
             string desktop = Directory.CreateDirectory(Path.Combine(root.FullName,"Fixture Desktop")).FullName;
             string first = Path.Combine(root.FullName,"First app.exe");
             string second = Path.Combine(root.FullName,"Moved app.exe");

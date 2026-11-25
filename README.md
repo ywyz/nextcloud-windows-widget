@@ -5,7 +5,7 @@
 ## 安装与连接
 
 1. 从 [GitHub Release](https://github.com/ywyz/nextcloud-windows-widget/releases/latest) 下载签名的 [Windows x64 EXE](https://github.com/ywyz/nextcloud-windows-widget/releases/latest/download/NextcloudWidget-win-x64.exe)，也可以使用[加速下载](https://github.ywyz.tech/https://github.com/ywyz/nextcloud-windows-widget/releases/latest/download/NextcloudWidget-win-x64.exe)。
-2. 将 EXE 放在自己的可写目录并双击运行。应用内含 .NET 桌面运行时。
+2. 双击 EXE 即可运行，应用内含 .NET 桌面运行时。从下载文件夹首次启动时，可选「选择文件夹并重启」，把程序复制到自己常用的可写文件夹，也可以继续在当前位置运行。以后可从「设置 → 更改程序存放位置」再次选择。
 3. 打开设置，填写 HTTPS 服务器地址，保留安装子路径。在系统浏览器中授权后返回小窗。
 4. 待办来自支持 VTODO 的 CalDAV 清单。邮件复用 Nextcloud Mail 中已有的邮箱，需要 Mail 的账户、收件箱和正文 OCS 接口。标记已读和移动邮件还需要服务端允许已授权应用调用 Mail 的写入接口。已验证 Nextcloud 32.0.15 与 Mail 5.13.3。
 
@@ -13,9 +13,10 @@
 
 - 待办页可按清单筛选。在输入框写下标题、选好可写清单并按 Enter，即可添加待办。需要备注或截止日期时再打开编辑。离线改动会在联网后同步，发生冲突时可对照两端版本选择。
 - 邮件页缓存每个收件箱最近 50 封邮件。打开正文会标记已读，后台预取保留未读状态。逐封勾选或全选后，可批量标记已读，也可确认后移到各自邮箱的废纸篓。离线操作会在联网后提交。邮箱需要有可识别的废纸篓才能执行移动。
+- 阅读图文邮件时，内嵌图片会随正文显示。点「显示远程图片」可加载这封邮件引用的网站图片。旧版已缓存的纯文本仍可离线阅读，联网同步后会补回服务器保留的图文正文。
 - 应用启动、恢复网络及运行期间每 5 分钟同步，也可手动刷新。邮件可见时间取决于 [Nextcloud Mail 自身的收信周期](https://docs.nextcloud.com/server/stable/admin_manual/groupware/mail.html#background-sync-interval)。
 - 主窗可拖动顶部、调整大小、置顶或收起到托盘，并记住日夜模式。正常使用时，收起、关闭主窗或从托盘退出都会在桌面创建或复用「Nextcloud 小窗」快捷方式。双击快捷方式即可恢复已收起的小窗，或在退出后重新启动。
-- 数据保存在当前 Windows 用户的 `%LOCALAPPDATA%\NextcloudWidget`。设备专属应用密码存入 Windows 凭据管理器。设置中的断开操作会清除本地账户缓存，包括尚未上传的修改。
+- 待办、邮件缓存、待同步的离线改动和个人设置默认保存在当前 Windows 用户的 `%LOCALAPPDATA%\NextcloudWidget`。设备专属应用密码存入 Windows 凭据管理器。清理下载目录只会删除其中的程序副本。即使误删了唯一的 EXE，在同一 Windows 账户下重新下载运行也能继续使用原有数据。设置中的断开操作会清除本地账户缓存，包括尚未上传的修改。
 
 ## 翻译邮件
 

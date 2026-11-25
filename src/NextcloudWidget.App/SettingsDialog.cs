@@ -15,6 +15,7 @@ internal sealed class SettingsDialog : WidgetDialog
     private readonly Button reauthorize = new();
     private readonly Button update = new();
     private readonly Button recheck = new();
+    private readonly Button location = new() { Content = "更改程序存放位置…" };
     private readonly Button translation = new() { Content = "配置翻译模型…" };
     private readonly Button cancelUpdate = new() { Content = "取消更新", Visibility = Visibility.Collapsed };
     private readonly TextBlock updateStatus = Text("");
@@ -61,6 +62,14 @@ internal sealed class SettingsDialog : WidgetDialog
         Fields.Children.Add(updateStatus);
         Fields.Children.Add(updateProgress);
         Fields.Children.Add(transferDetails);
+        Fields.Children.Add(Text("存放位置", 19));
+        Fields.Children.Add(Text($"数据目录　{host.DataDirectory}"));
+        if (host.CanChooseProgramLocation)
+        {
+            Fields.Children.Add(Text($"当前程序　{Environment.ProcessPath}"));
+            AutomationProperties.SetAutomationId(location, "ProgramLocationButton");
+            Configure(location, (_, _) => host.ChooseProgramLocation(this));
+        }
         ActionButton("关闭", (_, _) => Close()).IsCancel = true;
         Closed += (_, _) => lifetime.Cancel();
         RefreshButtons();
@@ -78,7 +87,7 @@ internal sealed class SettingsDialog : WidgetDialog
     {
         address.IsReadOnly = service.IsConnected || working;
         account.Content = service.IsConnected ? "断开并清除此账户缓存" : "在浏览器中授权";
-        account.IsEnabled = reauthorize.IsEnabled = update.IsEnabled = recheck.IsEnabled = translation.IsEnabled = !working;
+        account.IsEnabled = reauthorize.IsEnabled = update.IsEnabled = recheck.IsEnabled = translation.IsEnabled = location.IsEnabled = !working;
         reauthorize.Visibility = service.IsConnected ? Visibility.Visible : Visibility.Collapsed;
         displayedUpdate = host.AvailableVersion;
         update.Content = displayedUpdate == null ? "检查更新" : $"安装 {displayedUpdate.ToString(3)}";

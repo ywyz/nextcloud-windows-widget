@@ -2,6 +2,7 @@ using System.Globalization;
 using System.Net;
 using System.Net.Http.Headers;
 using System.Text.Json;
+using AngleSharp.Html.Parser;
 
 namespace NextcloudWidget.Core.Mail;
 
@@ -39,23 +40,42 @@ internal static class MailClient
         return result.Values.OrderByDescending(message => message.Date).ThenBy(message => message.Id).ToArray();
     }
 
-    internal static async Task<string> FetchBodyAsync(HttpClient client, Uri server, string id, CancellationToken ct)
+    internal static async Task<MailContent> FetchContentAsync(HttpClient client, Uri server, string id, CancellationToken ct)
     {
         var message = await GetDataAsync(client, server, $"message/{PositiveMessageNumber(id)}", ct);
         if (!message.TryGetProperty("body", out var body) || body.ValueKind == JsonValueKind.Null)
         {
             if (message.TryGetProperty("smime", out var smime) &&
                 smime.TryGetProperty("isEncrypted", out var encrypted) && encrypted.ValueKind == JsonValueKind.True)
-                return "此邮件已加密，服务器无法提供正文。";
+                return new MailContent("此邮件已加密，服务器无法提供正文。", "");
             throw new InvalidDataException("服务器未返回邮件正文。");
         }
 
         var content = body.GetString() ?? "";
+        var plain = message.TryGetProperty("hasHtmlBody", out var rich) && rich.ValueKind == JsonValueKind.False;
         var signature = Text(message, "signature");
         if (signature.Length > 0)
-            content += "\n-- \n" + signature;
-        var text = MailText.ToPlainText(content);
-        return text.Length == 0 ? "（此邮件无正文）" : text;
+            content += "<br>--<br>" + signature;
+        if (!plain && content.Contains("cid:", StringComparison.OrdinalIgnoreCase)
+            && message.TryGetProperty("inlineAttachments", out var attachments) && attachments.ValueKind == JsonValueKind.Array)
+        {
+            using var doc = new HtmlParser().ParseDocument(content);
+            var parts = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var attachment in attachments.EnumerateArray())
+            {
+                var part = Text(attachment, "id");
+                if (MailImages.ValidPart(part)) parts[Text(attachment, "cid").Trim('<', '>')] = part;
+            }
+            foreach (var image in doc.QuerySelectorAll("img[src]"))
+            {
+                var src = image.GetAttribute("src")!;
+                if (src.StartsWith("cid:", StringComparison.OrdinalIgnoreCase) && parts.TryGetValue(src[4..].Trim('<', '>'), out var part))
+                    image.SetAttribute("src", new Uri(Authorization.BaseUri(server), $"index.php/apps/mail/api/messages/{id}/attachment/{part}").AbsoluteUri);
+            }
+            content = doc.Body?.InnerHtml ?? content;
+        }
+        var text = MailText.ToPlainText(content, preserveNewlines: plain);
+        return new MailContent(text.Length == 0 ? "（此邮件无正文）" : text, plain ? "" : content);
     }
 
     internal static async Task<bool> IsMessageGoneAsync(HttpClient client, Uri server, string id, CancellationToken ct)

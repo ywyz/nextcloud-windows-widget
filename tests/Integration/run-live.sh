@@ -62,7 +62,7 @@ install_app mail https://github.com/nextcloud-releases/mail/releases/download/v5
 occ config:system:set allow_local_remote_servers --type boolean --value=true >/dev/null
 smtp_port=$(docker port "$mail" 3025/tcp | head -1 | cut -d: -f2)
 python3 - "$smtp_port" <<'PY'
-import sys, smtplib, time
+import base64, sys, smtplib, time
 from email.message import EmailMessage
 from email.utils import formatdate
 with smtplib.SMTP("127.0.0.1", int(sys.argv[1])) as smtp:
@@ -79,7 +79,22 @@ with smtplib.SMTP("127.0.0.1", int(sys.argv[1])) as smtp:
             message["Subject"] = f"fixture-{account}-{i:02}"
             message["Message-ID"] = f"<{account}-{i}@fixture.test>"
             message.set_content("Read https://example.test/manual")
-            message.add_alternative('<p>阅读 <a href="https://example.test/manual">手册</a></p>', subtype="html")
+            html = '<p>阅读 <a href="https://example.test/manual">手册</a></p>'
+            illustrated = account == "one" and i == 51
+            if illustrated:
+                html += """
+                    <table><tr><td>十一月 25</td></tr>
+
+                        <tr><td><img src="cid:memory@fixture.test" alt="当年的照片"></td></tr>
+                        <tr><td><img src="https://example.test/album.png" alt="远程照片"></td></tr>
+                        <tr><td><a href="https://example.test/album">快来看看</a></td></tr>
+                    </table>"""
+            message.add_alternative(html, subtype="html")
+            if illustrated:
+                photo = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAABAAAAAMCAIAAADkharWAAAAFklEQVR4nGPQzushCTGMahjV0INVAwAm0NvBB5m+agAAAABJRU5ErkJggg==")
+                message.get_payload()[-1].add_related(photo, maintype="image", subtype="png",
+                                                      cid="<memory@fixture.test>", filename="memory.png",
+                                                      disposition="inline")
             smtp.send_message(message)
 PY
 for user in one two; do

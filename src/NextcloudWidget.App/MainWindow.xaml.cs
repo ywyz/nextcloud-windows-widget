@@ -68,6 +68,21 @@ public partial class MainWindow : Window
     private ReleaseInfo? release;
     internal Version? AvailableVersion => release?.Version;
     internal string DataDirectory => preferences.DirectoryPath;
+    internal bool CanChooseProgramLocation => !smoke && PortableLocation.IsBundled &&
+        (maintainDesktopShortcut || ((App)Application.Current).CustomProfile != null);
+
+    internal void ChooseProgramLocation(Window owner, bool fromDownloads = false)
+    {
+        if (!CanChooseProgramLocation) return;
+        var current = Environment.ProcessPath!;
+        if (fromDownloads && (!maintainDesktopShortcut || string.Equals(current, preferences.State.AcknowledgedDownloadPath,
+            StringComparison.OrdinalIgnoreCase) || !PortableLocation.IsInDownloads(current))) return;
+        var dialog = new ProgramLocationDialog(this, owner, fromDownloads);
+        if (dialog.ShowDialog() != true || dialog.SelectedExecutable is not string selected) return;
+        preferences.Set(preferences.State with { AcknowledgedDownloadPath = selected });
+        if (!string.Equals(current, selected, StringComparison.OrdinalIgnoreCase))
+            ((App)Application.Current).RestartAt(selected);
+    }
 
     internal MainWindow(WidgetService service, Preferences preferences, bool smoke, bool maintainDesktopShortcut)
     {
@@ -565,16 +580,11 @@ public partial class MainWindow : Window
         var token = accountWork.Token;
         try
         {
-            string body;
-            if (!string.IsNullOrEmpty(row.Item.Body)) body = row.Item.Body;
-            else
-            {
-                MailStatus.Text = "正在读取邮件正文…";
-                body = await service.GetMailBodyAsync(row.Item.Id, token);
-            }
+            MailStatus.Text = "正在读取邮件正文…";
+            var body = await service.GetMailContentAsync(row.Item.Id, token);
             if (!stopped && !token.IsCancellationRequested)
             {
-                var reader = new MailDialog(this, row.Item, string.IsNullOrWhiteSpace(body) ? "（正文为空）" : body);
+                var reader = new MailDialog(this, row.Item, body, service);
                 if (row.Item.Unread) reader.ContentRendered += async (_, _) => await ChangeMailAsync([row.Item.Id], false);
                 reader.ShowDialog();
             }
@@ -672,14 +682,16 @@ public partial class MainWindow : Window
     }
     private void ExitApp()
     {
-        if (savingQuickTask) return;
-        if ((!string.IsNullOrWhiteSpace(QuickTitle.Text) || OwnedWindows.OfType<TaskDialog>().Any(w => w.IsVisible)) &&
-            WidgetPrompt.Show(this, "当前正在编辑待办。要放弃尚未保存的编辑并退出吗？", "退出小窗",
-                MessageBoxButton.YesNo, MessageBoxImage.Question, MessageBoxResult.No) != MessageBoxResult.Yes) return;
+        if (!CanExitWithDrafts(this)) return;
         EnsureDesktopShortcut();
         Stop();
         Application.Current.Shutdown();
     }
+
+    internal bool CanExitWithDrafts(Window owner) => !savingQuickTask &&
+        ((string.IsNullOrWhiteSpace(QuickTitle.Text) && !OwnedWindows.OfType<TaskDialog>().Any(w => w.IsVisible)) ||
+        WidgetPrompt.Show(owner, "当前正在编辑待办。要放弃尚未保存的编辑并退出吗？", "退出小窗",
+            MessageBoxButton.YesNo, MessageBoxImage.Question, MessageBoxResult.No) == MessageBoxResult.Yes);
     protected override void OnClosing(CancelEventArgs e)
     {
         if (!stopped && !smoke)

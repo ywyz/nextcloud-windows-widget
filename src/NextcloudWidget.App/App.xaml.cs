@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Security.Cryptography;
 using System.Text;
 using NextcloudWidget.Core;
@@ -11,6 +12,8 @@ public partial class App : Application
     private EventWaitHandle? showEvent;
     private RegisteredWaitHandle? showWait;
     private bool ownsMutex;
+    private string? restartPath;
+    internal string? CustomProfile { get; private set; }
 
     protected override async void OnStartup(StartupEventArgs e)
     {
@@ -28,6 +31,7 @@ public partial class App : Application
                 throw new ArgumentException("--data-dir 需要目录。");
             var directory = Path.GetFullPath(dirArg >= 0 ? e.Args[dirArg + 1] :
                 Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "NextcloudWidget"));
+            if (e.Args is ["--data-dir", _]) CustomProfile = directory;
             Directory.CreateDirectory(directory);
             var id = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(directory.ToUpperInvariant())))[..20];
             if (!smoke && !AcquireInstance(id))
@@ -52,7 +56,9 @@ public partial class App : Application
             bool updated = UpdateClient.TrySignalHealthy(e.Args);
             if (updated && DesktopShortcut.IsUserSession(e.Args, updateHandshake: true))
                 window.EnableDesktopShortcut();
+            if (updated && e.Args is ["--updated", _, "--data-dir", _]) CustomProfile = directory;
             window.StartBackgroundWork();
+            window.ChooseProgramLocation(window, fromDownloads: true);
         }
         catch (Exception ex)
         {
@@ -77,6 +83,13 @@ public partial class App : Application
         return true;
     }
 
+    internal void RestartAt(string executable)
+    {
+        restartPath = executable;
+        ((MainWindow)MainWindow).Stop();
+        Shutdown();
+    }
+
     protected override void OnExit(ExitEventArgs e)
     {
         (MainWindow as MainWindow)?.Stop();
@@ -84,6 +97,32 @@ public partial class App : Application
         showEvent?.Dispose();
         if (ownsMutex) instanceMutex?.ReleaseMutex();
         instanceMutex?.Dispose();
+        // The selected copy uses the same profile and must launch after its instance lock is gone.
+        if (restartPath != null)
+        {
+            bool started = false;
+            try
+            {
+                var start = new ProcessStartInfo(restartPath) {
+                    WorkingDirectory = Path.GetDirectoryName(restartPath)!, UseShellExecute = false };
+                if (CustomProfile != null)
+                {
+                    start.ArgumentList.Add("--data-dir");
+                    start.ArgumentList.Add(CustomProfile);
+                }
+                using var child = Process.Start(start);
+                if (child == null) throw new IOException("无法启动程序。");
+                started = true;
+                if (CustomProfile == null) DesktopShortcut.EnsureForCurrentUser(restartPath);
+            }
+            catch (Exception ex)
+            {
+                string detail = started ? "已从新位置启动，但未能更新桌面快捷方式。" :
+                    "文件已复制，自动重启失败。请从新位置双击启动。";
+                MessageBox.Show($"{detail}\n{restartPath}\n{ex.Message}",
+                    "程序存放位置", MessageBoxButton.OK, MessageBoxImage.Information);
+            }
+        }
         base.OnExit(e);
     }
 }

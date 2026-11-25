@@ -36,17 +36,45 @@ internal static class MailProtocolChecks
             "A missing subject must fall back and a label-only sender must stay readable.");
 
         // Body sync: the safe link survives while script, style, iframe and javascript: content is dropped.
-        var plain = await MailClient.FetchBodyAsync(http, server, "201", CancellationToken.None);
-        Check(plain == "Safe manual <https://example.test/manual> link.\nTrap\n-- \nFixture Signature",
-            "Sanitized body mismatch: " + plain);
+        var content = await MailClient.FetchContentAsync(http, server, "201", CancellationToken.None);
+        Check(content.Text == "Safe manual link.\nTrap\n--\nFixture Signature",
+            "Sanitized body mismatch: " + content.Text);
+        var rich = await MailClient.FetchContentAsync(http, server, "204", CancellationToken.None);
+        var runs = MailText.Parse(rich.Html);
+        Check(rich.Text.Contains("查看照片") && !rich.Text.Contains("http") && !rich.Text.Contains("\n\n\n") &&
+            rich.Text.Length < 100 && runs.Any(x => x.Link == "https://example.test/photos"),
+            "Newsletter indentation and link URLs should not fill the reader: " + rich.Text);
+        var images = runs.Where(x => x.Image != null).Select(x => MailImages.Resolve(x.Image!, server, "204")).ToArray();
+        Check(images.Contains(new MailImageSource(MailImageKind.Attachment, "1.2")) &&
+            images.Contains(new MailImageSource(MailImageKind.Remote, "https://photos.example/a.png")) &&
+            images.Contains(new MailImageSource(MailImageKind.Remote, "https://photos.example/card.png")) && images.Length == 3,
+            "Expected a CID attachment, a restored remote photo and a newsletter background. Got " + string.Join(", ", images.AsEnumerable()));
+        Check(MailImages.Resolve("file:///c:/private.png", server, "204") == null &&
+            MailImages.Resolve("https://fixture.test/photos/hosted.png", server, "204")?.Kind == MailImageKind.Remote &&
+            MailImages.Resolve("/nextcloud/apps/mail/api/messages/999/attachment/2", server, "204") == null &&
+            MailImages.Resolve("https://external.test/nextcloud/apps/mail/api/messages/204/attachment/1.2", server, "204")?.Kind == MailImageKind.Remote,
+            "Only this server and message's own attachment may load with credentials.");
+        var plain = await MailClient.FetchContentAsync(http, server, "205", CancellationToken.None);
+        Check(plain.Text == "Line one\n\n    Line  two" && plain.Html == "", "Preserve plain-text paragraphs, spacing and indentation: " + plain.Text);
+        Check(MailText.ToPlainText("<p>code</p><pre>if ok:\n    return 1</pre>") == "code\nif ok:\n    return 1", "Preserve preformatted indentation.");
+        Check(MailText.Parse("<a href='mailto:person@example.test'>联系我</a>").Single() ==
+            new MailRun("联系我", "mailto:person@example.test") && MailText.LinkTarget("file:///c:/test") == null,
+            "Email links keep their label and target while local file links stay inert.");
+        byte[] png = Convert.FromBase64String("iVBORw0KGgoAAAANSUhEUgAAABAAAAAMCAIAAADkharWAAAAFklEQVR4nGPQzushCTGMahjV0INVAwAm0NvBB5m+agAAAABJRU5ErkJggg==");
+        foreach (var raw in new[] { png, Encoding.ASCII.GetBytes(Convert.ToBase64String(png, Base64FormattingOptions.InsertLineBreaks)) })
+        {
+            using var transport = new HttpClient(new FakeHandler(path => new HttpResponseMessage(HttpStatusCode.OK) { Content = new ByteArrayContent(raw) }));
+            var bytes = await MailImages.DownloadAsync(transport, MailImages.AttachmentUrl(server, "204", "2.2"), default, attachment: true);
+            Check(png.SequenceEqual(bytes), "A raw or MIME Base64 attachment should yield the original raster bytes.");
+        }
 
         // Undecryptable mail (HTTP 206 with S/MIME) becomes notice text, unlike a real server error.
-        var encrypted = await MailClient.FetchBodyAsync(http, server, "202", CancellationToken.None);
-        Check(encrypted == "此邮件已加密，服务器无法提供正文。",
+        var encrypted = await MailClient.FetchContentAsync(http, server, "202", CancellationToken.None);
+        Check(encrypted.Text == "此邮件已加密，服务器无法提供正文。",
             "An undecryptable message should render as a notice instead of failing.");
 
         var failure = await ThrowsAsync<HttpRequestException>(
-            () => MailClient.FetchBodyAsync(http, server, "203", CancellationToken.None));
+            () => MailClient.FetchContentAsync(http, server, "203", CancellationToken.None));
         Check(failure.StatusCode == HttpStatusCode.InternalServerError,
             "An ordinary HTTP 500 on the detail endpoint must stay a distinct, retryable failure.");
         Console.WriteLine("PASS Mail OCS protocol checks against a fake transport.");
@@ -79,6 +107,26 @@ internal static class MailProtocolChecks
             Ocs(new { body = (string?)null, smime = new { isEncrypted = true } }, HttpStatusCode.PartialContent),
         "/nextcloud/ocs/v2.php/apps/mail/message/203" =>
             new HttpResponseMessage(HttpStatusCode.InternalServerError) { Content = new StringContent("boom") },
+        "/nextcloud/ocs/v2.php/apps/mail/message/204" => Ocs(new
+        {
+            hasHtmlBody = true,
+            inlineAttachments = new[] { new { id = "1.2", cid = "attached-photo" } },
+            body = """
+              <table>
+                <tr>   <td>&nbsp;</td> </tr>
+                <tr><td>十一月 25</td></tr>
+                <tr>
+                  <td><img src="cid:attached-photo" alt="照片"></td>
+                  <td><img src="/apps/mail/img/blocked-image.png" style="display: none !important"
+                        data-original-src="/nextcloud/index.php/apps/mail/proxy?id=204&amp;src=https%3A%2F%2Fphotos.example%2Fa.png" alt="回忆"></td>
+                </tr>
+                <tr><td data-original-style="background-image: url('https://photos.example/card.png')" style="background-image:url(/blocked-image.png)">往年</td></tr>
+                <tr><td><img width="1" height="1" src="https://tracking.example/pixel"></td></tr>
+                <tr><td><a href="https://example.test/photos">查看照片</a></td></tr>
+              </table>
+              """
+        }),
+        "/nextcloud/ocs/v2.php/apps/mail/message/205" => Ocs(new { hasHtmlBody = false, body = "Line one\r\n\r\n\r\n    Line  two" }),
         _ => throw new InvalidDataException("Unexpected mail request: " + path)
     };
 

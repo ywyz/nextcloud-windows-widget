@@ -21,6 +21,12 @@ internal sealed class WidgetCache
             CREATE INDEX IF NOT EXISTS tasks_list ON tasks(list);
             CREATE TABLE IF NOT EXISTS mail(id TEXT PRIMARY KEY, subject TEXT NOT NULL, sender TEXT NOT NULL, date TEXT NOT NULL, body TEXT NOT NULL, unread INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS mail_actions(id TEXT NOT NULL, kind TEXT NOT NULL, accepted INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(id,kind));
+            CREATE TABLE IF NOT EXISTS mail_content(id TEXT PRIMARY KEY, rich_html TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS mail_images(id TEXT NOT NULL, part TEXT NOT NULL, data BLOB NOT NULL, PRIMARY KEY(id,part));
+            CREATE TRIGGER IF NOT EXISTS remove_mail_content AFTER DELETE ON mail BEGIN
+                DELETE FROM mail_content WHERE id=OLD.id;
+                DELETE FROM mail_images WHERE id=OLD.id;
+            END;
             CREATE TABLE IF NOT EXISTS sync(channel TEXT PRIMARY KEY, stamp TEXT NOT NULL);
             """));
     }
@@ -183,7 +189,13 @@ internal sealed class WidgetCache
     internal List<MailItem> MailHeaders() => Read(db => Rows(db,
         "SELECT id,subject,sender,date,''," + EffectiveUnread + VisibleMail + " ORDER BY date DESC", MapMail));
     internal List<string> MissingBodies() => Read(db => Rows(db,
-        "SELECT id" + VisibleMail + " AND body='' ORDER BY date DESC", r => r.GetString(0)));
+        "SELECT id" + VisibleMail + " AND (body='' OR NOT EXISTS (SELECT 1 FROM mail_content c WHERE c.id=mail.id)) ORDER BY (body='') DESC, date DESC", r => r.GetString(0)));
+    internal (string Text, string? Html) ReadContent(string id) => Read(db =>
+    {
+        var rows = Rows(db, "SELECT body,(SELECT rich_html FROM mail_content c WHERE c.id=mail.id)" + VisibleMail +
+            " AND id=$p0", r => (r.GetString(0), Str(r, 1)), id);
+        return rows.Count == 1 ? rows[0] : throw new KeyNotFoundException("邮件已离开缓存范围。");
+    });
     internal MailItem? Message(string id) => Read(db => Rows(db, MailColumns + " AND id=$p0", MapMail, id).SingleOrDefault());
 
     internal void QueueMailActions(IReadOnlyCollection<string> ids, string kind) => Change(db =>
@@ -207,7 +219,7 @@ internal sealed class WidgetCache
         foreach (var m in messages)
         {
             Run(db, "INSERT INTO current_mail VALUES($p0)", m.Id);
-            Run(db, "INSERT INTO mail VALUES($p0,$p1,$p2,$p3,$p4,$p5) ON CONFLICT(id) DO UPDATE SET subject=excluded.subject,sender=excluded.sender,date=excluded.date,unread=excluded.unread,body=CASE WHEN mail.body='' THEN excluded.body ELSE mail.body END",
+            Run(db, "INSERT INTO mail(id,subject,sender,date,body,unread) VALUES($p0,$p1,$p2,$p3,$p4,$p5) ON CONFLICT(id) DO UPDATE SET subject=excluded.subject,sender=excluded.sender,date=excluded.date,unread=excluded.unread,body=CASE WHEN mail.body='' THEN excluded.body ELSE mail.body END",
                 m.Id, m.Subject, m.Sender, m.Date.ToUniversalTime().ToString("O"), m.Body, m.Unread);
         }
         // An accepted read can precede Mail's flag-cache refresh. After two minutes a
@@ -222,7 +234,23 @@ internal sealed class WidgetCache
             """, DateTimeOffset.UtcNow.ToUnixTimeSeconds());
         Run(db, "DELETE FROM mail WHERE id NOT IN (SELECT id FROM current_mail) AND id NOT IN (SELECT id FROM mail_actions WHERE accepted=0)");
     });
-    internal void SaveBody(string id, string body) => Change(db => Run(db, "UPDATE mail SET body=$p0 WHERE id=$p1", body, id));
+    internal void SaveBody(string id, string body, string html = "") => Change(db =>
+    {
+        Run(db, "UPDATE mail SET body=$p0 WHERE id=$p1", body, id);
+        Run(db, "INSERT OR REPLACE INTO mail_content(id,rich_html) SELECT id,$p0 FROM mail WHERE id=$p1", html, id);
+    });
+    internal byte[]? ReadImage(string id, string part) => Read(db =>
+        Rows(db, "SELECT data FROM mail_images WHERE id=$p0 AND part=$p1", r => (byte[])r[0], id, part).SingleOrDefault());
+    internal void SaveImage(string id, string part, byte[] bytes) => Change(db =>
+    {
+        Run(db, "INSERT OR REPLACE INTO mail_images SELECT id,$p1,$p2 FROM mail WHERE id=$p0", id, part, bytes);
+        Run(db, """
+            DELETE FROM mail_images WHERE rowid IN (
+                SELECT rowid FROM (SELECT rowid, SUM(length(data)) OVER (ORDER BY rowid DESC) AS bytes FROM mail_images)
+                WHERE bytes > 33554432
+            )
+            """);
+    });
     internal void MarkSync(string channel) => Change(db => Run(db, "INSERT INTO sync VALUES($p0,$p1) ON CONFLICT(channel) DO UPDATE SET stamp=excluded.stamp", channel, DateTimeOffset.UtcNow.ToString("O")));
     internal SyncInfo SyncInfo() => Read(db =>
     {

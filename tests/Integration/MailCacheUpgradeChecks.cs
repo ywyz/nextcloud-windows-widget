@@ -24,6 +24,20 @@ internal static class MailCacheUpgradeChecks
                 command.ExecuteNonQuery();
             }
             var cache = new WidgetCache(file);
+            Check(cache.MissingBodies().Order().SequenceEqual(["11", "22"]));
+            using (var db = new SqliteConnection(new SqliteConnectionStringBuilder { DataSource = file, Pooling = false }.ToString()))
+            {
+                db.Open();
+                using var legacy = db.CreateCommand();
+                legacy.CommandText = "INSERT INTO mail VALUES('33','rollback','sender','2026-01-01T00:00:00Z','plain',1)";
+                legacy.ExecuteNonQuery();
+                cache.SaveBody("33", "compact", "<p>compact</p>");
+                cache.SaveImage("33", "1.2", [1]);
+                legacy.CommandText = "DELETE FROM mail WHERE id='33'";
+                legacy.ExecuteNonQuery();
+                legacy.CommandText = "SELECT (SELECT count(*) FROM mail_content WHERE id='33') + (SELECT count(*) FROM mail_images WHERE id='33')";
+                Check((long)legacy.ExecuteScalar()! == 0);
+            }
             var stale = cache.Mail();
             cache.QueueMailActions(["11"], "read");
             cache.QueueMailActions(["22"], "trash");

@@ -267,7 +267,7 @@ public sealed class WidgetService : IDisposable
             Exception? bodyFailure = null;
             foreach (var id in s.Cache.MissingBodies())
             {
-                try { await Body(s, id, token).ConfigureAwait(false); }
+                try { await Body(s, id, token, refreshLegacy: true).ConfigureAwait(false); }
                 catch (HttpRequestException ex) when (ex.StatusCode is not HttpStatusCode.Unauthorized)
                 {
                     // Failures in one message leave downloaded headers and bodies available.
@@ -327,24 +327,49 @@ public sealed class WidgetService : IDisposable
         return failure;
     }
 
-    public Task<string> GetMailBodyAsync(string id, CancellationToken ct = default) =>
+    public async Task<string> GetMailBodyAsync(string id, CancellationToken ct = default) =>
+        (await GetMailContentAsync(id, ct).ConfigureAwait(false)).Text;
+    public Task<MailContent> GetMailContentAsync(string id, CancellationToken ct = default) =>
         Use((s, token) => Body(s, id, token), ct);
-    private static async Task<string> Body(Session s, string id, CancellationToken ct)
+    private static async Task<MailContent> Body(Session s, string id, CancellationToken ct, bool refreshLegacy = false)
     {
-        var message = s.Cache.Message(id) ?? throw new KeyNotFoundException("邮件已离开缓存范围。");
-        if (message.Body.Length != 0) return message.Body;
+        var cached = s.Cache.ReadContent(id);
+        if (cached.Text.Length != 0 && (cached.Html != null || !refreshLegacy))
+            return new MailContent(cached.Html == null ? CompactLegacyBody(cached.Text) : cached.Text, cached.Html ?? "");
         var single = s.Bodies[(uint)StringComparer.Ordinal.GetHashCode(id) % s.Bodies.Length];
         await single.WaitAsync(ct).ConfigureAwait(false);
         try
         {
-            message = s.Cache.Message(id) ?? throw new KeyNotFoundException("邮件已离开缓存范围。");
-            if (message.Body.Length != 0) return message.Body;
-            string body = await MailClient.FetchBodyAsync(s.Http, s.Account.Server, id, ct).ConfigureAwait(false);
-            s.Cache.SaveBody(id, body);
+            cached = s.Cache.ReadContent(id);
+            if (cached.Html != null && cached.Text.Length != 0) return new MailContent(cached.Text, cached.Html);
+            var body = await MailClient.FetchContentAsync(s.Http, s.Account.Server, id, ct).ConfigureAwait(false);
+            s.Cache.SaveBody(id, body.Text, body.Html);
             return body;
         }
         finally { single.Release(); }
     }
+
+    private static string CompactLegacyBody(string body)
+    {
+        var lines = body.ReplaceLineEndings("\n").Split('\n');
+        var result = new List<string>();
+        foreach (var line in lines)
+        {
+            var trimmed = line.TrimEnd();
+            if (trimmed.Length != 0 || (result.Count != 0 && result[^1].Length != 0)) result.Add(trimmed);
+        }
+        return string.Join("\n", result).TrimEnd();
+    }
+
+    public Task<byte[]> GetMailInlineImageAsync(string id, string partId, CancellationToken ct = default) =>
+        Use(async (s, token) =>
+        {
+            var url = MailImages.AttachmentUrl(s.Account.Server, id, partId);
+            if (s.Cache.ReadImage(id, partId) is { } cached) return cached;
+            var bytes = await MailImages.DownloadAsync(s.Http, url, token, attachment: true).ConfigureAwait(false);
+            s.Cache.SaveImage(id, partId, bytes);
+            return bytes;
+        }, ct);
 
     public void Dispose()
     {

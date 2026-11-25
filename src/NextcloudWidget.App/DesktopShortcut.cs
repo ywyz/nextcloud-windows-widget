@@ -26,12 +26,12 @@ internal static class DesktopShortcut
     internal static bool IsUserSession(string[] args, bool updateHandshake = false) =>
         args.Length == 0 || (updateHandshake && args is ["--updated", var token] && Guid.TryParseExact(token, "N", out _));
 
-    internal static void EnsureForCurrentUser()
+    internal static void EnsureForCurrentUser(string? executable = null)
     {
         string desktop = Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory);
         if (string.IsNullOrEmpty(desktop) || !Directory.Exists(desktop))
             throw new DirectoryNotFoundException("Windows 桌面目录不可用。");
-        var executable = Environment.ProcessPath ?? throw new IOException("无法确定小窗的启动程序。");
+        executable ??= Environment.ProcessPath ?? throw new IOException("无法确定小窗的启动程序。");
         Ensure(desktop, ShortcutTarget.FromProcess(executable, Environment.GetCommandLineArgs().FirstOrDefault()));
     }
 

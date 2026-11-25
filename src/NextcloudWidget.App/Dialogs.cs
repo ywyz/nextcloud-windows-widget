@@ -9,8 +9,9 @@ internal class WidgetDialog : Window
 {
     protected readonly StackPanel Fields = new();
     protected readonly WrapPanel Actions = new() { HorizontalAlignment = HorizontalAlignment.Right };
+    protected readonly DockPanel Layout = new() { Margin = new Thickness(18) };
 
-    protected WidgetDialog(Window owner, string title, double width, double height)
+    protected WidgetDialog(Window owner, string title, double width, double height, bool scrollFields = true)
     {
         Owner = owner;
         Icon = owner.Icon;
@@ -25,12 +26,16 @@ internal class WidgetDialog : Window
         ShowInTaskbar = false;
         FontFamily = new FontFamily("Segoe UI, Microsoft YaHei UI");
         FontSize = 14;
-        var panel = new DockPanel { Margin = new Thickness(18) };
         Actions.Margin = new Thickness(0, 14, 0, 0);
         DockPanel.SetDock(Actions, Dock.Bottom);
-        panel.Children.Add(Actions);
-        panel.Children.Add(new ScrollViewer { Content = Fields, VerticalScrollBarVisibility = ScrollBarVisibility.Auto });
-        Content = panel;
+        Layout.Children.Add(Actions);
+        if (scrollFields) Layout.Children.Add(new ScrollViewer { Content = Fields, VerticalScrollBarVisibility = ScrollBarVisibility.Auto });
+        else
+        {
+            DockPanel.SetDock(Fields, Dock.Top);
+            Layout.Children.Add(Fields);
+        }
+        Content = Layout;
     }
 
     protected static TextBlock Text(string value, double size = 14) => new()
@@ -170,28 +175,39 @@ internal sealed class MailDialog : WidgetDialog
     private CancellationTokenSource? request;
     private bool closed;
 
-    public MailDialog(Window owner, MailItem message, string body) : base(owner, "阅读邮件", 565, 580)
+    public MailDialog(MainWindow owner, MailItem message, MailContent body, WidgetService service)
+        : base(owner, "阅读邮件", 565, 580, scrollFields: false)
     {
-        original = body;
-        var host = (owner as MainWindow) ?? (MainWindow)Application.Current.MainWindow;
-        preferences = new TranslationPreferences(host.DataDirectory);
+        original = body.Text;
+        preferences = new TranslationPreferences(owner.DataDirectory);
         Fields.Children.Add(Text(string.IsNullOrEmpty(message.Subject) ? "（无主题）" : message.Subject, 20));
         Fields.Children.Add(Text($"{message.Sender}   ·   {message.Date.ToLocalTime():g}"));
-        var source = BodyBox(body);
-        AutomationProperties.SetName(source, "邮件正文");
-        AutomationProperties.SetAutomationId(source, "MailOriginalBody");
+        FrameworkElement source;
+        if (body.Html.Length > 0 && service.Server is { } server)
+        {
+            var view = new MailBodyView(body.Html, server, message.Id, service);
+            source = view;
+            Closed += (_, _) => view.Stop();
+        }
+        else
+        {
+            source = BodyBox(body.Text);
+            AutomationProperties.SetName(source, "邮件正文");
+            AutomationProperties.SetAutomationId(source, "MailOriginalBody");
+        }
         AutomationProperties.SetName(translation, "邮件译文");
         AutomationProperties.SetAutomationId(translation, "MailTranslatedBody");
         tabs.Items.Add(new TabItem { Header = "原文", Content = source });
         translated.Content = translation;
         tabs.Items.Add(translated);
         tabs.SelectedIndex = 0;
-        Fields.Children.Add(tabs);
         AutomationProperties.SetAutomationId(status, "TranslationStatus");
-        Fields.Children.Add(status);
+        DockPanel.SetDock(status, Dock.Bottom);
+        Layout.Children.Add(status);
+        Layout.Children.Add(tabs);
         translate = ActionButton("翻译", Translate);
         AutomationProperties.SetAutomationId(translate, "TranslateMail");
-        translate.IsEnabled = !string.IsNullOrWhiteSpace(body) && body is not ("（正文为空）" or "（此邮件无正文）" or "此邮件已加密，服务器无法提供正文。");
+        translate.IsEnabled = !string.IsNullOrWhiteSpace(original) && original is not ("（正文为空）" or "（此邮件无正文）" or "此邮件已加密，服务器无法提供正文。");
         cancel = ActionButton("取消翻译", (_, _) => request?.Cancel());
         AutomationProperties.SetAutomationId(cancel, "CancelTranslation");
         cancel.Visibility = Visibility.Collapsed;
@@ -202,7 +218,7 @@ internal sealed class MailDialog : WidgetDialog
     private static TextBox BodyBox(string value) => new()
     {
         Text = value, IsReadOnly = true, TextWrapping = TextWrapping.Wrap,
-        AcceptsReturn = true, Padding = new Thickness(7), MinHeight = 150
+        AcceptsReturn = true, Padding = new Thickness(7), VerticalScrollBarVisibility = ScrollBarVisibility.Auto
     };
 
     private async void Translate(object sender, RoutedEventArgs args)

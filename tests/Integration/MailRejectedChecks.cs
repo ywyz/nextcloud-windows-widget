@@ -29,9 +29,10 @@ internal static class MailRejectedChecks
             File.WriteAllText(Path.Combine(data.FullName, "account.json"), JsonSerializer.Serialize(account));
 
             // One cached unread message whose body must outlive every rejection.
-            new WidgetCache(Path.Combine(data.FullName, account.CacheId.ToString("N") + ".db"))
-                .SaveMail([new MailItem("11", "Queued read", "Fixture Sender <fixture@127.0.0.1>",
-                    DateTimeOffset.UnixEpoch, "cached body eleven", true)]);
+            var cache = new WidgetCache(Path.Combine(data.FullName, account.CacheId.ToString("N") + ".db"));
+            cache.SaveMail([new MailItem("11", "Queued read", "Fixture Sender <fixture@127.0.0.1>",
+                DateTimeOffset.UnixEpoch, "", true)]);
+            cache.SaveBody("11", "cached body eleven");
 
             bool seen = false;
             var put = HttpStatusCode.ServiceUnavailable;

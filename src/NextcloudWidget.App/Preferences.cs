@@ -8,7 +8,7 @@ internal sealed class Preferences
     internal string DirectoryPath => Path.GetDirectoryName(path)!;
     public sealed record Values(bool Pinned = false, double? Left = null, double? Top = null,
         double? Width = null, double? Height = null, DateTimeOffset? LastUpdateCheck = null,
-        bool DarkMode = false, string? LastTaskList = null);
+        bool DarkMode = false, string? LastTaskList = null, string? AcknowledgedDownloadPath = null);
     public Values State { get; private set; }
 
     public Preferences(string directory)
